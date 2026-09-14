@@ -344,6 +344,24 @@ def crop_morphology_image(
             store = level.aszarr()
             try:
                 za = zarr.open(store, mode="r")
+                if isinstance(za, zarr.Group):
+                    # NOTE(tifffile-zarr3): tifffile >=2026.5.2 rewrote
+                    # ZarrTiffStore for zarr format 3 / NGFF 0.5 and now wraps
+                    # even a single pyramid level's store in an NGFF-style
+                    # group (confirmed: zarr.open() used to return a plain
+                    # Array here, directly sliceable; now it's a Group whose
+                    # sole child is the actual pixel array). Older tifffile
+                    # didn't do this -- if this ever sees more than one array
+                    # child, tifffile's per-level group layout changed again
+                    # and this needs a real look rather than guessing which
+                    # child is the pixel data.
+                    array_keys = list(za.array_keys())
+                    if len(array_keys) != 1:
+                        raise ValueError(
+                            "expected exactly one array in tifffile's per-level "
+                            f"zarr group, got {array_keys!r}"
+                        )
+                    za = za[array_keys[0]]
                 lvl_axes = level.axes
                 ly, lx = lvl_axes.index("Y"), lvl_axes.index("X")
                 lvl_h, lvl_w = level.shape[ly], level.shape[lx]
