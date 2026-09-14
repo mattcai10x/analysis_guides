@@ -387,7 +387,21 @@ def crop_morphology_image(
     else:
         # Sequential pages, one per (cropped) pyramid level. See docstring: this
         # preserves level count/pixels, not full OME pyramid SubIFD metadata.
-        tifffile.imwrite(dst_path, cropped_levels[0], photometric="minisblack")
+        #
+        # NOTE(tifffile-zarr3): newer tifffile (confirmed against a version
+        # after 2026.5.2) refuses TiffWriter(..., append=True) with
+        # "cannot append to file containing metadata" whenever the base file
+        # was written with tifffile's default embedded "shaped" metadata --
+        # a real safety check (that metadata encodes an array shape/page
+        # count that a blind append would leave stale), not a bug. Since this
+        # code was never trying to maintain synced OME/shaped pyramid
+        # metadata across the appended pages anyway (see comment above),
+        # metadata=None on the first write keeps the base file a plain,
+        # metadata-less multi-page TIFF that's genuinely appendable, rather
+        # than forcing past the check with append='force'.
+        tifffile.imwrite(
+            dst_path, cropped_levels[0], photometric="minisblack", metadata=None
+        )
         with tifffile.TiffWriter(dst_path, append=True) as tw:
             for lvl in cropped_levels[1:]:
                 tw.write(lvl, photometric="minisblack")
