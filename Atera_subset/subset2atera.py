@@ -141,11 +141,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import resource
 import shutil
 import sys
 import time
 import warnings
+import xml.etree.ElementTree as ET
 
 import geopandas as gpd
 import numpy as np
@@ -365,112 +367,309 @@ def get_base_level_shape(src_path: str) -> tuple[int, int]:
         return base_shape[y_ax], base_shape[x_ax]
 
 
+def _patch_ome_xml_size(ome_xml: str, new_w: int, new_h: int) -> str:
+    """Return ``ome_xml`` with the ``<Pixels>`` element's ``SizeX``/``SizeY``
+    attributes replaced by the new cropped dimensions.
+
+    Deliberately a targeted string substitution, not a parse-and-reserialize
+    round-trip through `xml.etree` -- so every other byte (namespaces, Channel/
+    Plate/Instrument/StructuredAnnotations elements, the TiffData/UUID sibling
+    file references, attribute order and formatting) is preserved EXACTLY as
+    in the original file. `SizeX`/`SizeY` only ever appear once each, on the
+    one `<Pixels>` element, in every real bundle file inspected so far -- this
+    asserts that and fails loudly rather than silently patching zero or many.
+    """
+    patched, n = re.subn(r'SizeX="\d+"', f'SizeX="{new_w}"', ome_xml, count=1)
+    if n != 1:
+        raise RuntimeError(f"expected exactly one SizeX attribute in OME-XML, found {n}")
+    patched, n = re.subn(r'SizeY="\d+"', f'SizeY="{new_h}"', patched, count=1)
+    if n != 1:
+        raise RuntimeError(f"expected exactly one SizeY attribute in OME-XML, found {n}")
+    return patched
+
+
+def _discover_channel_filenames(ome_xml: str, own_filename: str) -> list[str]:
+    """Discover every sibling physical file backing one logical multi-file OME
+    image, by parsing ``<TiffData FirstC="i" ...><UUID FileName="..."/></TiffData>``
+    entries out of ``ome_xml``.
+
+    Confirmed against a real Atera bundle: ``morphology_2d/ch0000_dapi.ome.tif``'s
+    own OME-XML lists all 4 channel files this way (one channel's pixel data per
+    physical file, all 4 sharing one logical `<Image>`/`<Pixels SizeC="4">`), even
+    though the `experiment.spatial` manifest only ever names the one (channel 0)
+    file. If no such structure is found -- confirmed for morphology_3d, whose
+    OME-XML has a plain ``<TiffData PlaneCount="14"/>`` with no per-channel UUID
+    refs, since it is single-channel (`SizeC="1"`) despite being a 3D Z-stack --
+    this returns just ``[own_filename]``.
+
+    Returns filenames (not full paths) in channel-index (``FirstC``) order.
+    """
+    root = ET.fromstring(ome_xml)
+    entries: list[tuple[int, str]] = []
+    for elem in root.iter():
+        if elem.tag != "TiffData" and not elem.tag.endswith("}TiffData"):
+            continue
+        first_c = int(elem.get("FirstC", "0"))
+        for child in elem:
+            if child.tag == "UUID" or child.tag.endswith("}UUID"):
+                filename = child.get("FileName")
+                if filename:
+                    entries.append((first_c, filename))
+                break
+    if not entries:
+        return [own_filename]
+    entries.sort(key=lambda e: e[0])
+    found_indices = [e[0] for e in entries]
+    if found_indices != list(range(len(entries))):
+        raise RuntimeError(
+            f"OME-XML TiffData FirstC values are not a contiguous 0..{len(entries) - 1} "
+            f"range: {found_indices}"
+        )
+    return [filename for _, filename in entries]
+
+
+def _iter_cropped_levels(
+    series,
+    base_h: int,
+    base_w: int,
+    crop_window_px: tuple[int, int, int, int],
+    channel_axis_name: str | None,
+    channel_index: int | None,
+):
+    """Yield each pyramid level's windowed crop, one level at a time.
+
+    ``crop_window_px`` is the level-0 ``(x0, y0, x1, y1)`` window; every other
+    level's window is derived by proportional scaling (matching the ratio of
+    that level's own shape to the base level's), same as before.
+
+    If ``channel_axis_name`` is given (the 2D multi-channel-file case), only
+    ``channel_index`` along that axis is read out -- e.g. for a 4-channel
+    merged series, this reads just ONE channel's data per level, never all 4
+    at once, so a caller processing channels one at a time (see
+    `crop_morphology_image`) never holds more than one channel's pyramid in
+    memory. If ``channel_axis_name`` is ``None`` (3D Z-stack, or a plain 2D
+    image with no extra axis at all), the full array is read for every level
+    (e.g. every Z-slice, since morphology_3d files are single-channel and the
+    whole Z-stack is what gets written to one output file).
+    """
+    levels = list(getattr(series, "levels", [series]))
+    x0, y0, x1, y1 = crop_window_px
+    for i, level in enumerate(levels):
+        lvl_axes = level.axes
+        ly, lx = lvl_axes.index("Y"), lvl_axes.index("X")
+        lvl_h, lvl_w = level.shape[ly], level.shape[lx]
+
+        if i == 0:
+            ry0, rx0, ry1, rx1 = y0, x0, y1, x1
+        else:
+            scale_y, scale_x = lvl_h / base_h, lvl_w / base_w
+            ry0 = max(0, int(np.floor(y0 * scale_y)))
+            ry1 = min(lvl_h, int(np.ceil(y1 * scale_y)))
+            rx0 = max(0, int(np.floor(x0 * scale_x)))
+            rx1 = min(lvl_w, int(np.ceil(x1 * scale_x)))
+            ry0, ry1 = min(ry0, ry1), max(ry0, ry1)
+            rx0, rx1 = min(rx0, rx1), max(rx0, rx1)
+            ry1, rx1 = max(ry1, ry0 + 1), max(rx1, rx0 + 1)
+
+        # NOTE(tifffile-zarr3): tifffile >=2026.5.2 rewrote ZarrTiffStore for
+        # zarr format 3 / NGFF 0.5. Calling .aszarr() with no level= kwarg does
+        # NOT give you just that level -- confirmed empirically: ZarrTiffStore
+        # reads self._data from `arg.levels`, which returns the *same* full
+        # pyramid-level list regardless of which per-level object `arg` is.
+        # `series.aszarr(level=i)` is the documented way to get a single,
+        # directly-sliceable Array store for exactly level `i`.
+        store = series.aszarr(level=i)
+        try:
+            za = zarr.open(store, mode="r")
+            sl = [slice(None)] * len(lvl_axes)
+            sl[ly] = slice(ry0, ry1)
+            sl[lx] = slice(rx0, rx1)
+            if channel_axis_name is not None:
+                sl[lvl_axes.index(channel_axis_name)] = channel_index
+            yield np.asarray(za[tuple(sl)])
+        finally:
+            if hasattr(store, "close"):
+                store.close()
+
+
+def _write_pyramid_tiff(
+    dst_path: str,
+    level_arrays: list[np.ndarray],
+    ome_xml: str,
+    tile: tuple[int, int],
+    compression,
+    photometric,
+) -> None:
+    """Write ``level_arrays`` (base resolution first) back as a real pyramidal
+    OME-TIFF: the base level is written with ``subifds=N-1``, and every other
+    level is written immediately after with ``subfiletype=1`` -- tifffile's
+    documented pattern for nesting lower-resolution levels as SubIFDs of the
+    base IFD, which is the SAME structure confirmed (via
+    ``inspect_morphology_tiff.py``/``inspect_2d_subifds.py``/
+    ``inspect_3d_subifds.py`` against a real bundle) that both `tifffile` and
+    (implicitly) whatever reads these bundles expect -- as opposed to writing
+    each level as its own sibling top-level page/series, which an earlier
+    version of this function did and which turned out to silently break
+    `dask_image.imread`-based readers entirely (see git history).
+
+    ``ome_xml`` is written verbatim as the base level's `ImageDescription` (via
+    ``description=``, with ``metadata=None`` so tifffile does not additionally
+    try to generate/merge its own description) -- matching the real files,
+    where only the base page carries `ImageDescription` and every SubIFD has
+    none.
+
+    Known gap vs. the original: JPEG2000 encoder parameters (e.g. reversible
+    vs irreversible wavelet, target quality/ratio) are NOT reproduced exactly,
+    only the same compression algorithm/tile shape/photometric/dtype -- this
+    would need `compressionargs=` tuned to match, not yet done. `bigtiff=True`
+    is always used (the source files are BigTIFF; a small crop still opening
+    fine as BigTIFF is harmless, whereas a large crop written as a classic
+    TIFF could hit the 4 GiB offset limit).
+    """
+    import tifffile
+
+    n = len(level_arrays)
+    with tifffile.TiffWriter(dst_path, bigtiff=True) as tw:
+        kwargs = dict(photometric=photometric, tile=tile, compression=compression)
+        if n == 1:
+            tw.write(level_arrays[0], metadata=None, description=ome_xml, **kwargs)
+        else:
+            tw.write(level_arrays[0], subifds=n - 1, metadata=None, description=ome_xml, **kwargs)
+            for lvl in level_arrays[1:]:
+                tw.write(lvl, subfiletype=1, **kwargs)
+
+
 def crop_morphology_image(
     src_path: str,
-    dst_path: str,
+    dst_dir: str,
     bbox_px: tuple[float, float, float, float],
     margin_px: float = 32.0,
     crop_window_px: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int]:
-    """Windowed crop of an OME-TIFF's BASE (level-0) resolution only, without ever
-    loading the full resolution level into memory. Returns the level-0 pixel
-    window actually used, as ``(x0, y0, x1, y1)`` -- this is the new local pixel
-    origin every other cropped element (cells, masks, transcripts) must be made
-    relative to, per the alignment fix described in this module's docstring.
+    """Windowed, memory-bounded crop of a real Atera morphology OME-TIFF,
+    preserving its actual on-disk structure: a real resolution pyramid
+    (written as SubIFDs, not sequential top-level pages -- see
+    `_write_pyramid_tiff`) and the original OME-XML metadata (copied forward
+    verbatim except for the cropped `SizeX`/`SizeY` -- see
+    `_patch_ome_xml_size`). Returns the level-0 pixel window actually used, as
+    ``(x0, y0, x1, y1)`` -- this is the new local pixel origin every other
+    cropped element (cells, masks, transcripts) must be made relative to, per
+    the alignment fix described in this module's docstring.
 
-    Opens the source series' level-0 zarr-store view via ``.aszarr(level=0)`` and
-    slices only the crop window out of it (a tiled TIFF decodes only the touched
-    tiles; a stripped/non-tiled TIFF decodes only the touched scanlines -- either
-    way, far less than the whole level), then writes that single array back with
-    one plain ``tifffile.imwrite()`` call.
+    An earlier version of this function wrote only level 0 with no real
+    pyramid at all, reasoning that a cropped ROI would always be small enough
+    not to need one -- Matt corrected this: a cropped ROI can be just as large
+    as the source image, so it still needs to be pyramided the same way, for
+    the same zoom-performance reasons, when ziggy renders it directly from the
+    final bundle.
 
-    ``crop_window_px``, if given, is the already-computed level-0 window (from
-    :func:`_compute_crop_window_px`) to use instead of recomputing it from
-    ``bbox_px``/``margin_px`` -- callers that also need the window for other
-    purposes (``stage2_crop``, to align the cells crop) should compute it once
-    via :func:`get_base_level_shape` + :func:`_compute_crop_window_px` and pass
-    it here, so there is exactly one source of truth for "where did the image
-    actually get cropped."
+    ``src_path`` is the ONE file the `experiment.spatial` manifest actually
+    names (e.g. ``morphology_2d/ch0000_dapi.ome.tif``) -- used both to compute
+    the crop window (from its own base-level shape) and, via its OME-XML, to
+    discover every sibling channel file that must ALSO be cropped and carried
+    forward (confirmed against a real bundle: `morphology_2d` is 4 separate
+    single-channel files, one per fluorescence channel, that together back one
+    logical multi-channel `<Image>`; `morphology_3d` is a single file, a real
+    Z-stack, with no sibling channel files at all -- see
+    `_discover_channel_filenames`). ``dst_dir`` is the output DIRECTORY every
+    discovered file gets written into, under its own original filename.
 
-    **Deliberately does NOT preserve the source's other pyramid levels** (an
-    earlier version of this function did, writing them as sequential TIFF pages
-    to "preserve the same number of resolution levels as the source" -- removed
-    after finding it fundamentally incompatible with how this cropped file is
-    actually consumed downstream, not just a cosmetic gap):
-
-    1. `subset2atera.py` always calls `spatialdata_io.readers.atera.atera()`
-       with `image_models_kwargs={"scale_factors": None}` (a cropped ROI is
-       already small; no multiscale pyramid is wanted), so nothing downstream
-       ever asks for more than one resolution level.
-    2. Both `_get_images` (2D) and `_get_morphology_3d_image` (3D) in
-       `spatialdata_io` read the file via `dask_image.imread.imread(path)`,
-       which has **no concept of pyramid levels at all** -- it just stacks
-       every PAGE in the file along a new leading axis, assuming each page is
-       a CHANNEL (2D) or Z-SLICE (3D) of one single-resolution image, all the
-       same shape. Handing it a file whose pages are actually
-       different-resolution pyramid levels is a real, confirmed bug: it
-       produces a wrong-shaped/wrong-ndim array, which crashed downstream
-       inside `Image3DModel.parse()` (`IndexError: tuple index out of range`,
-       the internal `chunks` tuple shorter than `data.dims`) the first time a
-       real 3D morphology image reached this reader.
-
-    Since nothing downstream ever wanted more than level 0 anyway, the fix is
-    to simply never write the other levels (and skip cropping/reading them
-    too, which is strictly less I/O than before) -- not to make the reader
-    pyramid-aware. This also sidesteps entirely the multi-page-TIFF
-    append/metadata saga a level-preserving version of this function used to
-    have to work around (see git history) -- level-0-only writes with a single
-    `tifffile.imwrite()` call and never reopens the file.
-
-    Known gap vs. an ideal implementation: since only one resolution level is
-    written, a real full OME pyramid is not reproduced -- by design, per the
-    above. Memory cost: bounded by the crop window's pixel count (at most a few
-    tens of MB for a typical ROI), never the full slide (which is exactly the
-    ~10s-of-GB-per-channel object this function exists to avoid loading).
+    For a multi-channel-file image, each channel is read and written ONE AT A
+    TIME (all its pyramid levels materialized, then written, before moving to
+    the next channel) rather than reading every channel's data for a level
+    simultaneously -- bounding peak memory to roughly one channel's pyramid
+    (dominated by its base level), not N channels' worth, which matters once
+    crops are allowed to be large. Confirmed empirically (against a real
+    bundle) that `series.aszarr(level=j)` sliced down to a single channel
+    index returns byte-identical content to reading that channel's own
+    physical SubIFD directly, and that a 3D file's SubIFDs are each the head
+    of their own full per-Z-slice chain (NOT a single flat slice, unlike the
+    2D per-channel case) -- `series.aszarr(level=j)` is what correctly
+    reconstructs that chain into one array; reading a 3D SubIFD directly the
+    way a 2D channel file's SubIFD can be read would silently return only
+    Z=0's data repeated, which is why this function always reads through
+    `series.aszarr()` rather than ever walking SubIFD pages by hand.
     """
     import tifffile
+
+    os.makedirs(dst_dir, exist_ok=True)
+    src_dir = os.path.dirname(src_path)
 
     with tifffile.TiffFile(src_path) as tf:
         series = tf.series[0]
         levels = list(getattr(series, "levels", [series]))
-        level0 = levels[0]
-        base_shape = level0.shape
-        base_axes = level0.axes  # e.g. "YX", "CYX", "CZYX"
-        y_ax = base_axes.index("Y")
-        x_ax = base_axes.index("X")
+        base_shape = levels[0].shape
+        base_axes = levels[0].axes  # e.g. "YX", "CYX", "ZYX"
+        y_ax, x_ax = base_axes.index("Y"), base_axes.index("X")
         base_h, base_w = base_shape[y_ax], base_shape[x_ax]
 
         if crop_window_px is None:
             crop_window_px = _compute_crop_window_px(base_h, base_w, bbox_px, margin_px)
         x0, y0, x1, y1 = crop_window_px
+        new_w, new_h = x1 - x0, y1 - y0
 
-        # NOTE(tifffile-zarr3): tifffile >=2026.5.2 rewrote ZarrTiffStore for
-        # zarr format 3 / NGFF 0.5. Calling .aszarr() with no level= kwarg does
-        # NOT give you just level 0 -- confirmed empirically: ZarrTiffStore
-        # reads self._data from `arg.levels`, which returns the *same* full
-        # pyramid-level list regardless of which per-level object `arg` is, so
-        # it produced a >1-level, NGFF multiscales *group* rather than a bare
-        # Array -- and `za[tuple(slice, ...)]` on a Group raises TypeError
-        # (expects a string key). ZarrTiffStore's own documented `level`
-        # parameter ("Pyramidal level to wrap") is exactly for this: passing
-        # it explicitly makes self._data a single-item list, which takes the
-        # non-multiscales path and returns a plain, directly-sliceable Array
-        # store -- matching the old (pre-2026.5.2) behavior exactly.
-        store = series.aszarr(level=0)
-        try:
-            za = zarr.open(store, mode="r")
-            sl = [slice(None)] * len(base_axes)
-            sl[y_ax] = slice(y0, y1)
-            sl[x_ax] = slice(x0, x1)
-            cropped = np.asarray(za[tuple(sl)])
-        finally:
-            if hasattr(store, "close"):
-                store.close()
+        p0 = tf.pages[0]
+        tile = (p0.tilelength or 1024, p0.tilewidth or 1024)
+        compression = p0.compression
+        photometric = p0.photometric
 
-    os.makedirs(os.path.dirname(os.path.abspath(dst_path)) or ".", exist_ok=True)
-    tifffile.imwrite(dst_path, cropped, photometric="minisblack")
+        ref_ome_xml = tf.ome_metadata
+        if ref_ome_xml is None:
+            raise RuntimeError(f"{src_path}: not recognized as OME-TIFF (tf.ome_metadata is None)")
+        channel_files = _discover_channel_filenames(ref_ome_xml, os.path.basename(src_path))
 
-    return x0, y0, x1, y1
+        if len(channel_files) > 1:
+            extra_axes = [a for a in base_axes if a not in ("Y", "X")]
+            if len(extra_axes) != 1:
+                raise RuntimeError(
+                    f"{src_path}: OME-XML lists {len(channel_files)} sibling channel "
+                    f"files, but the base level's axes are {base_axes!r} (expected "
+                    "exactly one extra non-Y/X axis to index channels by)."
+                )
+            channel_axis_name = extra_axes[0]
+            n_channels_in_data = base_shape[base_axes.index(channel_axis_name)]
+            if n_channels_in_data != len(channel_files):
+                raise RuntimeError(
+                    f"{src_path}: OME-XML lists {len(channel_files)} channel files but "
+                    f"the {channel_axis_name!r} axis has size {n_channels_in_data}."
+                )
+            for c, fname in enumerate(channel_files):
+                sib_path = os.path.join(src_dir, fname)
+                with tifffile.TiffFile(sib_path) as sib_tf:
+                    sib_base_shape = sib_tf.pages[0].shape
+                    sib_ome_xml = sib_tf.ome_metadata
+                if sib_base_shape != (base_h, base_w):
+                    raise RuntimeError(
+                        f"{sib_path}: own base page shape {sib_base_shape} != reference "
+                        f"file's base (Y, X) shape {(base_h, base_w)} -- sibling channel "
+                        "files are expected to share the same base resolution."
+                    )
+                if sib_ome_xml is None:
+                    raise RuntimeError(f"{sib_path}: not recognized as OME-TIFF (ome_metadata is None)")
+                patched_ome_xml = _patch_ome_xml_size(sib_ome_xml, new_w, new_h)
+                level_arrays = list(
+                    _iter_cropped_levels(
+                        series, base_h, base_w, crop_window_px,
+                        channel_axis_name=channel_axis_name, channel_index=c,
+                    )
+                )
+                _write_pyramid_tiff(
+                    os.path.join(dst_dir, fname), level_arrays, patched_ome_xml, tile, compression, photometric
+                )
+        else:
+            fname = channel_files[0]
+            patched_ome_xml = _patch_ome_xml_size(ref_ome_xml, new_w, new_h)
+            level_arrays = list(
+                _iter_cropped_levels(
+                    series, base_h, base_w, crop_window_px,
+                    channel_axis_name=None, channel_index=None,
+                )
+            )
+            _write_pyramid_tiff(
+                os.path.join(dst_dir, fname), level_arrays, patched_ome_xml, tile, compression, photometric
+            )
+
+    return crop_window_px
 
 
 def maybe_crop_binned_transcripts(src: str, dst: str, bbox, skip: bool) -> bool:
@@ -608,9 +807,15 @@ def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp
             continue
         rel = images_manifest[key]
         src = os.path.join(input_dir, rel)
-        dst = os.path.join(tmp_dir, rel)
-        if not _skip_if_present(dst, args.force_redo):
-            used_window = crop_morphology_image(src, dst, bbox_px, crop_window_px=crop_window_px)
+        # `dst_dir` is where crop_morphology_image writes EVERY file it
+        # discovers (all 4 per-channel files for morphology_2d, the one
+        # Z-stack file for morphology_3d) -- not just the manifest-named
+        # reference file; `dst_ref` (that one reference file's own path) is
+        # what the resume/skip check and downstream tmp-manifest use.
+        dst_dir = os.path.join(tmp_dir, os.path.dirname(rel))
+        dst_ref = os.path.join(dst_dir, os.path.basename(rel))
+        if not _skip_if_present(dst_ref, args.force_redo):
+            used_window = crop_morphology_image(src, dst_dir, bbox_px, crop_window_px=crop_window_px)
             if used_window != crop_window_px:
                 # Can only happen if morphology_2d/morphology_3d have different
                 # base resolutions (not expected -- both should share the same
@@ -623,10 +828,11 @@ def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp
                     "this pipeline assumes never happens."
                 )
         else:
-            print(f"  [resume] {dst} already exists, skipping re-crop")
-        out[out_key] = dst
+            print(f"  [resume] {dst_ref} already exists, skipping re-crop")
+        out[out_key] = dst_ref
+        out[out_key + "_dir"] = dst_dir
         out[out_key + "_rel"] = rel
-    log_checkpoint("Stage 2d: morphology image(s) windowed-cropped to local origin")
+    log_checkpoint("Stage 2d: morphology image(s) windowed-cropped to local origin, pyramid preserved")
 
     # -- binned_transcripts.zarr.zip: skipped by default --
     if TRANSCRIPTS_VIZ_ZARR_KEY in explorer_files:
@@ -1049,10 +1255,17 @@ def main() -> None:
     written_files = dict(stage2_files)
     for key in ("morphology_2d", "morphology_3d"):
         if key in stage2_files:
-            rel = stage2_files[key + "_rel"]
-            dst = os.path.join(args.output, rel)
-            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-            shutil.copy2(stage2_files[key], dst)
+            # Copy every file `crop_morphology_image` wrote into this image's
+            # tmp directory -- not just the one manifest-named reference file.
+            # For morphology_2d that's all 4 per-channel files (see
+            # crop_morphology_image's docstring); for morphology_3d it's the
+            # one Z-stack file. The manifest itself still only ever names the
+            # reference file (stage2_files[key + "_rel"]), same as before.
+            src_dir = stage2_files[key + "_dir"]
+            dst_dir = os.path.join(args.output, os.path.dirname(stage2_files[key + "_rel"]))
+            os.makedirs(dst_dir, exist_ok=True)
+            for fname in os.listdir(src_dir):
+                shutil.copy2(os.path.join(src_dir, fname), os.path.join(dst_dir, fname))
 
     if "binned_transcripts" in stage2_files:
         shutil.copy2(stage2_files["binned_transcripts"], os.path.join(args.output, "binned_transcripts.zarr.zip"))
