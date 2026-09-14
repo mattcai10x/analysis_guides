@@ -528,13 +528,23 @@ def _write_pyramid_tiff(
     """
     import tifffile
 
+    # NOTE: real Atera OME-XML has literal non-ASCII characters (e.g. the µ in
+    # `PhysicalSizeXUnit="µm"`), but tifffile's `description=` argument enforces
+    # strict 7-bit ASCII when given a plain `str` ("TIFF strings must be 7-bit
+    # ASCII", confirmed hit on a real run). Passing UTF-8-encoded `bytes`
+    # instead bypasses that check and round-trips byte-for-byte correctly
+    # (verified: `tf.ome_metadata` reads back the exact original string,
+    # literal µ included) -- this is presumably also how the original bundle's
+    # own writer produced these files in the first place.
+    ome_xml_bytes = ome_xml.encode("utf-8")
+
     n = len(level_arrays)
     with tifffile.TiffWriter(dst_path, bigtiff=True) as tw:
         kwargs = dict(photometric=photometric, tile=tile, compression=compression)
         if n == 1:
-            tw.write(level_arrays[0], metadata=None, description=ome_xml, **kwargs)
+            tw.write(level_arrays[0], metadata=None, description=ome_xml_bytes, **kwargs)
         else:
-            tw.write(level_arrays[0], subifds=n - 1, metadata=None, description=ome_xml, **kwargs)
+            tw.write(level_arrays[0], subifds=n - 1, metadata=None, description=ome_xml_bytes, **kwargs)
             for lvl in level_arrays[1:]:
                 tw.write(lvl, subfiletype=1, **kwargs)
 
