@@ -475,21 +475,41 @@ def crop_morphology_image(
         # Sequential pages, one per (cropped) pyramid level. See docstring: this
         # preserves level count/pixels, not full OME pyramid SubIFD metadata.
         #
-        # NOTE(tifffile-zarr3): newer tifffile (confirmed against a version
-        # after 2026.5.2) refuses TiffWriter(..., append=True) with
-        # "cannot append to file containing metadata" whenever the base file
-        # was written with tifffile's default embedded "shaped" metadata --
-        # a real safety check (that metadata encodes an array shape/page
-        # count that a blind append would leave stale), not a bug. Since this
-        # code was never trying to maintain synced OME/shaped pyramid
-        # metadata across the appended pages anyway (see comment above),
-        # metadata=None on the first write keeps the base file a plain,
-        # metadata-less multi-page TIFF that's genuinely appendable, rather
-        # than forcing past the check with append='force'.
-        tifffile.imwrite(
-            dst_path, cropped_levels[0], photometric="minisblack", metadata=None
-        )
-        with tifffile.TiffWriter(dst_path, append=True) as tw:
+        # NOTE(tifffile-zarr3, superseded fix): an earlier version of this
+        # code wrote level 0 via a plain `imwrite()`, closing the file, then
+        # reopened it with `TiffWriter(dst_path, append=True)` to add the
+        # remaining levels. Newer tifffile (confirmed on a version after
+        # 2026.5.2) raises "cannot append to file containing metadata" on
+        # that reopen -- and passing `metadata=None` to the first `imwrite()`
+        # did NOT avoid it: `is_appendable`'s exact definition has changed
+        # across tifffile versions/is defined deep in a >2600-line function
+        # this session couldn't fully fetch, so patching around whatever
+        # check a given tifffile release happens to run is fragile and kept
+        # breaking again on version bumps.
+        #
+        # The robust fix is to never close and reopen the file at all: keep
+        # ONE `TiffWriter` session open (no `append=True`, so the "is this
+        # existing file safe to extend" check -- whatever it currently does
+        # -- is never invoked in the first place) and call `.write()` once
+        # per level before closing. This is tifffile's normal, intended
+        # pattern for a multi-page file with heterogeneously-shaped pages
+        # (e.g. a pyramid), and has no version-dependent append-safety logic
+        # to keep up with.
+        #
+        # `metadata=None` on the FIRST `.write()` call only (confirmed
+        # empirically, against locally-installed tifffile 2025.5.10): without
+        # it, tifffile's default embedded "shaped" metadata on page 0 makes
+        # each differently-shaped page read back as its OWN separate
+        # single-level `series` instead of one `series` with N `.levels` --
+        # i.e. writing without `metadata=None` silently drops the "this is a
+        # pyramid" structure `crop_morphology_image`'s own re-read logic
+        # (`series.aszarr(level=i)`) and downstream consumers
+        # (`spatialdata_io`/ziggy) rely on `series[0].levels` for. Passing it
+        # again on later `.write()` calls isn't necessary (verified: same
+        # grouped-series-with-levels result either way), so it's only passed
+        # once here to be minimal.
+        with tifffile.TiffWriter(dst_path) as tw:
+            tw.write(cropped_levels[0], photometric="minisblack", metadata=None)
             for lvl in cropped_levels[1:]:
                 tw.write(lvl, photometric="minisblack")
 
