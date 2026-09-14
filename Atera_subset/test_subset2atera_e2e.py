@@ -34,6 +34,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atera_dataset_tools import validate  # noqa: E402
+from atera_dataset_tools.formats import binned_transcripts as bt_mod  # noqa: E402
 from atera_dataset_tools.formats import cell_feature_matrix as cfm  # noqa: E402
 from atera_dataset_tools.formats import cells as cells_mod  # noqa: E402
 from atera_dataset_tools.formats import transcripts as tr_mod  # noqa: E402
@@ -145,6 +146,22 @@ def build_synthetic_bundle(root: str) -> None:
         obs_index_col="barcode", var_index_col="feature_name", major_axis="feature",
     )
 
+    # -- binned_transcripts.zarr.zip: viz-only density raster. Tile (0,0) covers
+    #    x/y in [0, grid_size) in absolute coordinates (tile bounds are computed
+    #    from the tile index * grid_size directly -- see
+    #    atera_dataset_tools.crop._tiles_in_bbox -- an "origin" attr is metadata
+    #    only, not consulted there), which overlaps the selection polygon used by
+    #    this test (box(-5, -20, half, 80) with half > 0) as long as it's built
+    #    with a positive grid_size, regardless of exactly where the cells/
+    #    transcripts happen to sit -- so this doesn't need to be coordinated with
+    #    cell_cx/cell_cy above to land inside the kept region. Two tiles/two genes
+    #    (the make_fixture default already leaves one gene empty) so the test can
+    #    actually observe *something* dropped, not just a same-size passthrough.
+    bt_mod.make_fixture(
+        os.path.join(root, "binned_transcripts.zarr.zip"),
+        number_genes=3, rows=4, cols=4, grid_size=50.0, n_tiles=2, seed=0,
+    )
+
     # -- tiny morphology images (single-resolution; no real pyramid) --
     import tifffile
 
@@ -178,6 +195,7 @@ def build_synthetic_bundle(root: str) -> None:
         "panel_config": "synthetic_panel",
         "explorer_files": {
             "transcripts_zarr_filepath": "transcripts.zarr.zip",
+            "transcripts_viz_zarr_filepath": "binned_transcripts.zarr.zip",
             "cells_zarr_filepath": "cells.zarr.zip",
             "cell_feature_zarr_filepath": "cell_feature_matrix.zarr.zip",
             "cell_feature_viz_zarr_filepath": "csc_cell_feature_matrix.zarr.zip",
@@ -247,6 +265,18 @@ def test_end_to_end(tmp_path):
     assert validate.validate_transcripts(os.path.join(output_dir, "transcripts.zarr.zip")) == []
     assert validate.validate_cell_feature_matrix(os.path.join(output_dir, "cell_feature_matrix.zarr.zip")) == []
     assert validate.validate_cell_feature_matrix(os.path.join(output_dir, "csc_cell_feature_matrix.zarr.zip")) == []
+
+    # -- binned_transcripts.zarr.zip: included by default (not skipped), and the
+    #    streaming per-gene crop produced a structurally valid, genuinely smaller
+    #    (not just a passthrough copy) result --
+    binned_out_path = os.path.join(output_dir, "binned_transcripts.zarr.zip")
+    assert os.path.exists(binned_out_path)
+    assert validate.validate_binned_transcripts(binned_out_path) == []
+    binned_in = bt_mod.read(os.path.join(root, "binned_transcripts.zarr.zip"))
+    binned_out = bt_mod.read(binned_out_path)
+    in_tiles = sum(len(g.tiles) for g in binned_in.genes.values())
+    out_tiles = sum(len(g.tiles) for g in binned_out.genes.values())
+    assert 0 < out_tiles <= in_tiles
 
     # -- experiment.spatial is valid JSON with the expected shape --
     with open(os.path.join(output_dir, "experiment.spatial")) as f:

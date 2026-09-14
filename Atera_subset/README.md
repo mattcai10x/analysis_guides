@@ -64,11 +64,29 @@ python3 test_subset2atera_e2e.py
 
 It asserts:
 - the output bundle passes `atera_dataset_tools.validate`'s structural checks
-  for `cells.zarr.zip`, `transcripts.zarr.zip`, and both cell-feature matrices;
+  for `cells.zarr.zip`, `transcripts.zarr.zip`, both cell-feature matrices, and
+  `binned_transcripts.zarr.zip`;
 - `experiment.spatial` is valid JSON with copied-forward + recomputed fields;
 - the output actually has fewer cells and fewer transcripts than the input
-  (not a no-op);
+  (not a no-op), and `binned_transcripts.zarr.zip` has fewer-or-equal tiles
+  than the source (not a passthrough copy);
 - the cropped morphology image is narrower than the source image.
+
+## Included by default: `binned_transcripts.zarr.zip` and `csc_cell_feature_matrix.zarr.zip`
+
+Both are viz-only/derived -- not needed for structural correctness -- but are
+included in the output by default anyway, since the point of this script is a
+bundle that's actually visualizable in ziggy, not just a valid one.
+`csc_cell_feature_matrix.zarr.zip` was never skippable in the first place (it's
+cropped the same way as the CSR matrix, just sequentially after it, to keep
+peak memory to one ~6.9GB matrix at a time rather than two). `binned_transcripts
+.zarr.zip` (~5.3GB) is cropped via `crop_binned_transcripts_to_bbox`, which as
+of this session streams one gene at a time (reads, filters, and writes each
+gene's nested-zip archive independently, then discards it) rather than loading
+every gene's every tile into memory at once -- the latter was this format's
+original crop implementation and would have meant a ~5.3GB peak just to crop
+it. Pass `--skip-binned-transcripts` to omit it if the density view isn't
+needed for a given use case.
 
 ### What this validates vs. what it can't
 

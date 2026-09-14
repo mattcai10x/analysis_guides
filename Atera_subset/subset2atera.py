@@ -87,10 +87,16 @@
 #      (`TiffFile(...).series[...].levels[i].aszarr()`), one pyramid level at a
 #      time, so the full slide image is never materialized in memory. See
 #      `crop_morphology_image()`'s docstring for exactly what is shipped vs. ideal.
-#   e. binned_transcripts.zarr.zip is skipped by default (`--skip-binned-transcripts`,
-#      default True): it is viz-only/derived and not needed for correctness;
-#      regenerating it cheaply from the already-small cropped transcripts is left
-#      as a TODO (see `maybe_crop_binned_transcripts()`).
+#   e. binned_transcripts.zarr.zip and csc_cell_feature_matrix.zarr.zip are both
+#      viz-only/derived (not needed for *correctness*), but ARE included by
+#      default: the whole point of this script is a bundle that's actually
+#      visualizable in ziggy, not just structurally valid. csc_* was never
+#      skipped (see 2c above). binned_transcripts.zarr.zip is cropped via
+#      `crop_binned_transcripts_to_bbox`, which streams one gene at a time
+#      (see `atera_dataset_tools.crop`'s module docstring) rather than loading
+#      the whole ~5.3GB file at once -- pass `--skip-binned-transcripts` to
+#      omit it anyway (e.g. if ziggy's density view isn't needed for a given
+#      use case and you'd rather skip the extra I/O).
 #
 # Stage 3 (small data now -- safe to fully materialize):
 #   a. `spatialdata_io.atera()` on the Stage-2 bundle for images/labels/shapes only.
@@ -348,13 +354,17 @@ def crop_morphology_image(
 def maybe_crop_binned_transcripts(src: str, dst: str, bbox, skip: bool) -> bool:
     """Returns True if a binned_transcripts.zarr.zip was written to dst.
 
-    TODO (documented, not implemented): binned_transcripts.zarr.zip is a viz-only,
-    derived density raster. Once the cropped transcripts.zarr.zip is small, it
-    should be much cheaper to *regenerate* the density raster from it directly
-    than to crop the original (up to 5.3GB) file -- but that regeneration logic
-    does not exist yet in `atera_dataset_tools`. When `skip` is False, this falls
-    back to the existing (bbox tile-level) `crop_binned_transcripts_to_bbox`
-    against the ORIGINAL file, which does touch that large file once.
+    Included by default (see `skip`'s default in `main()`): binned_transcripts.zarr.zip
+    is viz-only/derived, but this script's whole point is a bundle that's actually
+    visualizable in ziggy, so it isn't optional in practice. Uses
+    `crop_binned_transcripts_to_bbox`, which streams one gene at a time (reads,
+    filters, and writes each gene's nested-zip archive independently) rather than
+    loading the whole file into memory -- see `atera_dataset_tools.crop`'s module
+    docstring. Possible future optimization, not yet implemented: regenerating the
+    density raster directly from the already-small cropped transcripts, rather
+    than touching the original file at all -- would save the one remaining full
+    pass over binned_transcripts.zarr.zip, but isn't needed for correctness or to
+    keep memory bounded (the streaming crop already does that).
     """
     if skip:
         return False
@@ -664,9 +674,13 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                          help="Run Stage 0+1 only: report how many cells/tiles would be kept, then exit.")
     parser.add_argument("--skip-binned-transcripts", dest="skip_binned_transcripts", action="store_true",
-                         default=True, help="Skip binned_transcripts.zarr.zip entirely (default: True).")
+                         default=False,
+                         help="Skip binned_transcripts.zarr.zip entirely (default: False -- it is cropped "
+                              "and included by default so the output bundle is visualizable in ziggy's "
+                              "density view; the crop streams one gene at a time, so this is cheap).")
     parser.add_argument("--include-binned-transcripts", dest="skip_binned_transcripts", action="store_false",
-                         help="Crop binned_transcripts.zarr.zip from the original file instead of skipping it.")
+                         help="Crop binned_transcripts.zarr.zip from the original file (this is the default; "
+                              "this flag exists to override an earlier --skip-binned-transcripts).")
     parser.add_argument("--keep-tmp", action="store_true",
                          help="Do not delete the Stage-2 intermediate directory afterward.")
     parser.add_argument("--tmp-dir", default=None,
