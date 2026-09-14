@@ -30,6 +30,7 @@ import uuid
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -239,6 +240,32 @@ def run_subset2atera(input_dir: str, polygon_path: str, output_dir: str, extra_a
     return result.stdout + result.stderr
 
 
+def test_load_polygon_converts_pixels_to_microns(tmp_path):
+    """Regression test for a real bug: a polygon exported in pixel space (drawn
+    against the morphology image) has to be scaled to microns before it's
+    compared against cell/transcript coordinates, which are always in microns.
+    A pixel-space polygon's bbox can look like a perfectly plausible
+    micron-space region, so this doesn't error -- it silently selects the
+    wrong (often zero) cells. Hence `--polygon-units` is required, not
+    defaulted, and this test pins down the actual conversion math."""
+    import geopandas as gpd
+    from shapely.geometry import box
+
+    import subset2atera
+
+    poly_path = str(tmp_path / "poly.geojson")
+    poly = box(0.0, 0.0, 100.0, 200.0)
+    gpd.GeoDataFrame({"geometry": [poly]}, crs="EPSG:4326").to_file(poly_path, driver="GeoJSON")
+
+    converted = subset2atera.load_polygon(poly_path, units="pixels", pixel_size=PIXEL_SIZE)
+    assert converted.bounds == pytest.approx(
+        (0.0, 0.0, 100.0 * PIXEL_SIZE, 200.0 * PIXEL_SIZE)
+    )
+
+    passthrough = subset2atera.load_polygon(poly_path, units="microns", pixel_size=PIXEL_SIZE)
+    assert passthrough.bounds == pytest.approx((0.0, 0.0, 100.0, 200.0))
+
+
 def test_dry_run(tmp_path):
     root = str(tmp_path / "bundle")
     info = build_synthetic_bundle(root)
@@ -246,7 +273,7 @@ def test_dry_run(tmp_path):
     build_polygon_geojson(polygon_path, max_x=float(info["cell_cx"].max()))
 
     output_dir = str(tmp_path / "out_dryrun")
-    out = run_subset2atera(root, polygon_path, output_dir, extra_args=["--dry-run"])
+    out = run_subset2atera(root, polygon_path, output_dir, extra_args=["--polygon-units", "microns", "--dry-run"])
     assert "[dry-run]" in out
     assert not os.path.exists(os.path.join(output_dir, "experiment.spatial"))
 
@@ -258,7 +285,7 @@ def test_end_to_end(tmp_path):
     build_polygon_geojson(polygon_path, max_x=float(info["cell_cx"].max()))
 
     output_dir = str(tmp_path / "out")
-    run_subset2atera(root, polygon_path, output_dir, extra_args=["--keep-tmp"])
+    run_subset2atera(root, polygon_path, output_dir, extra_args=["--polygon-units", "microns", "--keep-tmp"])
 
     # -- structural validity (real atera_dataset_tools validators) --
     assert validate.validate_cells(os.path.join(output_dir, "cells.zarr.zip")) == []

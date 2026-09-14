@@ -29,22 +29,50 @@ export PYTHONPATH="/path/to/atera-dataset-tools:/path/to/spatialdata-io/src:/pat
 
 ## Usage
 
+`--polygon-units` is required -- see "Polygon units: microns vs. pixels" below
+before running this for the first time against a real bundle.
+
 ```bash
-python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir>
+python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir> --polygon-units microns
 
 # Cheap sanity check first (Stage 0+1 only, touches no large files):
-python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir> --dry-run
+python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir> --polygon-units microns --dry-run
 
 # Keep the Stage-2 intermediates around (for debugging, or to resume Stage 3
 # after a crash without re-running the expensive crops):
-python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir> --keep-tmp
+python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir> --polygon-units microns --keep-tmp
 
 # Also dump the full assembled SpatialData object as a .zarr:
-python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir> -z <out.zarr>
+python3 subset2atera.py -i <input_bundle_dir> -p <polygon.geojson> -o <output_dir> --polygon-units microns -z <out.zarr>
 ```
 
 Run again with the same `-o` (and without `--force-redo`) to resume: Stage 2
 crops whose tmp-dir output already exists are skipped.
+
+### Polygon units: microns vs. pixels
+
+Every spatial comparison in this script (cell centroids, transcript positions,
+tile bboxes) is in microns -- that's the unit `cells.zarr.zip`/
+`transcripts.zarr.zip` store natively. A polygon drawn or exported against the
+*morphology image* (e.g. from an image-space annotation tool) is typically in
+**pixels** instead, and a GeoJSON file gives no indication either way -- the
+coordinates are just floats.
+
+This is a real trap, not a hypothetical one: the first real-bundle dry run
+against this script reported plausible tile-level bbox overlap but exactly
+zero cells kept, which turned out to be exactly this -- a pixel-space polygon
+compared against micron-space cell centroids, not a location or code bug.
+Because a pixel-space bbox over real tissue can easily *look* like a
+plausible micron-space region (both are "a few thousand units"), this doesn't
+fail loudly on its own -- it just silently selects the wrong (often zero)
+cells. That's why `--polygon-units {microns,pixels}` is a required flag
+rather than a silently-assumed default: get it wrong and you find out
+immediately (zero cells, refused), rather than getting a subtly-wrong output
+bundle.
+
+If your polygon is in pixels, pass `--polygon-units pixels`; the script
+converts it to microns using the bundle's own `pixel_size` (microns/pixel)
+from `experiment.spatial`, before any cell/transcript comparison happens.
 
 ## Testing
 

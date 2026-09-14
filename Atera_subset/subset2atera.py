@@ -222,9 +222,36 @@ def log_checkpoint(label: str) -> None:
 # --------------------------------------------------------------------------------
 
 
-def load_polygon(polygon_path: str):
+def load_polygon(polygon_path: str, *, units: str, pixel_size: float):
+    """Load the selection polygon and convert it to microns if needed.
+
+    Every downstream spatial comparison in this script -- cell centroids
+    (`/cell_summary`), transcript positions, tile bboxes -- is in microns.
+    Polygons exported from an image-space viewer (drawing against the
+    morphology image, which is natively pixel-indexed) are in *pixels*
+    instead, and nothing about a GeoJSON file's contents distinguishes the
+    two: the coordinates are just floats, and a pixel-space polygon over a
+    real tissue image can easily have a bounding box that superficially
+    looks plausible in micron space too (both are "a few thousand units"),
+    so this mismatch does not fail loudly -- it just silently selects zero
+    (or the wrong) cells. That's exactly what happened building this
+    pipeline: a real bundle's dry run reported tile-level bbox overlap but
+    zero exact cell matches, which turned out to be a pixel/micron unit
+    mismatch, not a location or shapely bug. Hence `--polygon-units` is a
+    required flag rather than a silently-assumed default.
+    """
+    from shapely import affinity
+
     gdf = gpd.read_file(polygon_path)
-    return gdf.geometry[0]
+    geom = gdf.geometry[0]
+    if units == "pixels":
+        # pixel_size is microns-per-pixel (same manifest field used elsewhere
+        # in this script, e.g. the morphology-image crop and the transcripts
+        # Scale transform) -- so microns = pixels * pixel_size. Scale about
+        # the true origin (0, 0), not shapely's default "center" origin,
+        # since this is an absolute unit conversion, not a resize.
+        geom = affinity.scale(geom, xfact=pixel_size, yfact=pixel_size, origin=(0, 0))
+    return geom
 
 
 # --------------------------------------------------------------------------------
@@ -671,6 +698,17 @@ def main() -> None:
     parser.add_argument("-p", "--polygon", required=True, help="Path to selection GeoJSON")
     parser.add_argument("-o", "--output", required=True, help="Output directory")
     parser.add_argument("-z", "--zarr_out", help="Optional: path to save the subsetted SpatialData .zarr")
+    parser.add_argument(
+        "--polygon-units", required=True, choices=["microns", "pixels"],
+        help=(
+            "Units the polygon GeoJSON's coordinates are in. Required (no default) because "
+            "this is silently wrong in a way that doesn't error -- a pixel-space polygon's "
+            "bbox can look like a perfectly plausible micron-space region, and you just get "
+            "zero (or the wrong) cells selected instead of a loud failure. Everything else in "
+            "this bundle (cell centroids, transcript positions) is in microns; pass 'pixels' "
+            "if your polygon was drawn/exported against the morphology image instead."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true",
                          help="Run Stage 0+1 only: report how many cells/tiles would be kept, then exit.")
     parser.add_argument("--skip-binned-transcripts", dest="skip_binned_transcripts", action="store_true",
@@ -690,12 +728,13 @@ def main() -> None:
     args = parser.parse_args()
 
     log_checkpoint("Stage 0: starting")
-    target_polygon = load_polygon(args.polygon)
-    bbox = target_polygon.bounds  # (min_x, min_y, max_x, max_y)
 
     with open(os.path.join(args.input, MANIFEST_FILENAME)) as f:
         manifest = json.load(f)
     pixel_size = float(manifest["pixel_size"])
+
+    target_polygon = load_polygon(args.polygon, units=args.polygon_units, pixel_size=pixel_size)
+    bbox = target_polygon.bounds  # (min_x, min_y, max_x, max_y) -- always microns from here on
 
     cells_zarr_path = os.path.join(args.input, manifest[EXPLORER_FILES_KEY][CELLS_ZARR_KEY])
     keep_rows, n_total, n_kept = select_cells(cells_zarr_path, target_polygon)
