@@ -99,43 +99,37 @@
 #      use case and you'd rather skip the extra I/O).
 #
 # --------------------------------------------------------------------------------
-# COORDINATE ALIGNMENT: cells/masks/image are local-origin; transcripts stay absolute
+# COORDINATE ALIGNMENT: everything is relative to the cropped image's local origin
 # --------------------------------------------------------------------------------
 # The cropped morphology image is written at LOCAL pixel origin (0, 0) -- there is
 # no field anywhere in this toolchain (the experiment.spatial manifest schema, the
 # OME-XML, or spatialdata_io's atera() reader, which hard-codes an Identity()
 # transform) to instead record the crop's absolute (min_x, min_y) offset. So this
-# script shifts cell/nucleus centroids, per-cell bboxes, polygon vertices, and the
-# /masks pixel rasters (all of cells.zarr.zip) to be relative to that same local
-# origin, which is computed ONCE in `stage2_crop` (as the exact level-0 pixel
-# window `crop_morphology_image` will use, via `_compute_crop_window_px` -- this
-# already accounts for `crop_morphology_image`'s `margin_px` padding and edge
-# clamping, not just the raw GeoJSON bbox) and threaded through
-# `crop_cells_by_ids`'s `coord_offset`/`mask_bbox_px` params (Stage 2b). This
-# works because cells.zarr.zip's masks are literal pixel rasters cropped in
-# lockstep with the image -- shifting them and the image together keeps both
-# self-consistent, with no separate absolute-coordinate bookkeeping needed.
-#
-# `transcripts.zarr.zip` is the one exception, and deliberately does NOT get this
-# treatment (see `filter_transcripts_to_polygon`'s docstring for the full
-# reasoning, confirmed against a real ziggy failure): ziggy has no notion of a
-# bundle being a spatial subset of something larger, so a subset bundle's
-# transcript positions must look exactly like they would in a full, unsubset
-# bundle -- i.e. real, original, absolute microns, never shifted. Exact-polygon
-# filtering (Stage 3b) still happens in that same absolute-micron space, matching
-# `target_polygon`; only which rows survive changes, never their coordinates.
-# This does mean the optional full-SpatialData zarr export (`-z/--zarr_out`, see
-# 3f below) ends up internally inconsistent -- `points["transcripts"]` in
-# absolute coordinates, `images`/`labels`/`shapes` in local-origin ones -- since
-# `build_points` uses whatever `filter_transcripts_to_polygon` returns as-is; that
-# tradeoff is intentional (ziggy is the target this whole coordinate scheme is
-# built for) but worth knowing if `--zarr_out` is ever opened in something like
-# napari-spatialdata expecting everything to overlay correctly.
-#
-# The cells/masks/image shift must be applied EXACTLY ONCE per absolute-origin
+# script shifts every OTHER coordinate (transcript x/y, cell/nucleus centroids,
+# per-cell bboxes, polygon vertices, and the /masks pixel rasters) to be relative
+# to that same local origin, which is computed ONCE in `stage2_crop` (as the exact
+# level-0 pixel window `crop_morphology_image` will use, via
+# `_compute_crop_window_px` -- this already accounts for `crop_morphology_image`'s
+# `margin_px` padding and edge clamping, not just the raw GeoJSON bbox) and
+# threaded through: `crop_cells_by_ids`'s `coord_offset`/`mask_bbox_px` params
+# (Stage 2b) shift/crop cells.zarr.zip, and `filter_transcripts_to_polygon`'s
+# `coord_offset` param (Stage 3b) shifts transcripts after exact polygon
+# filtering (which must stay in absolute-micron space to match the still-absolute
+# `target_polygon`). This shift must be applied EXACTLY ONCE per absolute-origin
 # source -- the Stage 3d "sync dropped more cells" re-crop (a second
 # `crop_cells_by_ids` call, operating on the ALREADY-shifted Stage 2 output) does
 # NOT pass these params again, on purpose.
+#
+# Only the position VALUES shift. Every root-attrs field describing the
+# coordinate system (transcripts.zarr.zip's spatial_units/coordinate_space, and
+# anything analogous elsewhere) is copied through from the source file verbatim,
+# never rewritten to describe the crop or the shift in any way. Ziggy has no
+# notion of a bundle being a spatial subset of something larger -- a cropped
+# bundle needs to look like an ordinary, smaller, self-consistent bundle with its
+# own local origin (exactly the way the full slide is self-consistent with its
+# own origin), not one carrying metadata that flags a shift ziggy was never built
+# to interpret. So alignment is entirely a data-side concern (shift the values to
+# match the cropped image); the metadata side must stay untouched.
 #
 # Stage 3 (small data now -- safe to fully materialize):
 #   a. `spatialdata_io.atera()` on the Stage-2 bundle for images/labels/shapes only.
@@ -897,7 +891,9 @@ def _resolve_gene_names(t: "adt_transcripts.Transcripts") -> np.ndarray:
     return gene_names[gene_ix]
 
 
-def filter_transcripts_to_polygon(cropped_transcripts_path: str, target_polygon):
+def filter_transcripts_to_polygon(
+    cropped_transcripts_path: str, target_polygon, coord_offset: tuple[float, float] | None = None
+):
     """Read the (already tile-bbox-cropped, small) transcripts.zarr.zip and keep
     only the transcripts whose exact (x, y) fall inside `target_polygon`.
     Returns the filtered `Transcripts` dataclass and the resolved gene-name array
@@ -905,22 +901,24 @@ def filter_transcripts_to_polygon(cropped_transcripts_path: str, target_polygon)
 
     `target_polygon` is in ABSOLUTE microns (Stage 0's original, unshifted
     polygon), matching the still-absolute coordinates in `cropped_transcripts_path`
-    -- containment filtering happens in that absolute space.
+    at this point -- so containment filtering happens first, in absolute space.
+    `coord_offset`, if given, is applied AFTER filtering: every kept transcript's
+    (x, y) is shifted by `-coord_offset` to match the local origin the cropped
+    morphology image and `cells.zarr.zip` (see `stage2_crop`) were already shifted
+    to. Passing the same `target_polygon` used for Stage 1's cell selection but a
+    mismatched/missing `coord_offset` here would silently misalign transcripts
+    against everything else in the output bundle.
 
-    Deliberately NOT shifted to the crop-local origin the way `cells.zarr.zip`
-    and the morphology image(s) are (see `stage2_crop`'s `coord_offset`):
-    ziggy has no notion of a bundle being a spatial subset of something larger,
-    so `transcripts.zarr.zip`'s positions need to look exactly like they would
-    in an unsubset, full-slide bundle -- i.e. the real, original, absolute
-    coordinates, unchanged by cropping. (Cropping cells.zarr.zip's masks/
-    cell_summary to a local origin works today only because the masks are
-    literal pixel arrays cropped in lockstep with the image -- there is no
-    separate global/local coordinate reconciliation for a raster overlay the
-    way there is for the continuous micron positions transcripts.zarr.zip
-    stores.) Confirmed against real ziggy behavior: shifting these to a local
-    origin (matching a mismatched `coordinate_space` label still saying
-    "refined-final_global_micron") makes ziggy load the bundle but never
-    display any transcripts.
+    The shifted values are still written under whatever root attrs (spatial_units,
+    coordinate_space, etc.) the source file had -- copied through verbatim, never
+    rewritten to say anything about a shift or a new/different coordinate space.
+    Ziggy has no notion of a bundle being a spatial subset of something larger; a
+    subset bundle needs to look like a smaller, ordinary, self-consistent bundle
+    with its own local origin, the same way the full slide is self-consistent
+    with *its* origin -- not a smaller bundle carrying metadata that describes a
+    shift ziggy was never built to interpret. So the fix for alignment is doing
+    this shift (matching cells.zarr.zip/the image), not touching any metadata
+    field to describe it.
     """
     from shapely import vectorized
 
@@ -929,6 +927,10 @@ def filter_transcripts_to_polygon(cropped_transcripts_path: str, target_polygon)
 
     x_position = t.x_position[mask]
     y_position = t.y_position[mask]
+    if coord_offset is not None:
+        ox, oy = coord_offset
+        x_position = x_position - ox
+        y_position = y_position - oy
 
     filtered = adt_transcripts.Transcripts(
         number_genes=t.number_genes,
@@ -1229,21 +1231,20 @@ def main() -> None:
     )
     log_checkpoint("Stage 3a: SpatialData built (images/labels/shapes only)")
 
-    # -- Stage 3b: exact polygon filter on transcripts (cheap: already tile-cropped).
-    #    Positions are kept in their original, absolute coordinates -- NOT shifted
-    #    to the local origin cells.zarr.zip and the morphology image(s) were
-    #    shifted to in Stage 2 (see stage2_crop). Ziggy has no notion of a
-    #    cropped/subset bundle, so transcripts.zarr.zip must look like it would
-    #    in a full, unsubset bundle; see filter_transcripts_to_polygon's
-    #    docstring for why this deliberately does NOT mirror the cells/image
-    #    local-origin shift, and how that was confirmed against a real ziggy
-    #    failure (bundle loaded, but no transcripts ever rendered). --
+    # -- Stage 3b: exact polygon filter on transcripts (cheap: already tile-cropped),
+    #    then shift to the same local origin cells.zarr.zip and the morphology
+    #    image(s) were already shifted to in Stage 2 (see stage2_crop). Root attrs
+    #    (coordinate_space etc.) are copied through unchanged by
+    #    filter_transcripts_to_polygon -- only the position VALUES shift; nothing
+    #    in the written metadata ever describes that shift, since ziggy has no
+    #    notion of a cropped/subset bundle and isn't built to interpret one. --
+    coord_offset = stage2_files["coord_offset"]
     filtered_transcripts, gene_names_per_row = filter_transcripts_to_polygon(
-        stage2_files["transcripts"], target_polygon
+        stage2_files["transcripts"], target_polygon, coord_offset=coord_offset
     )
     sdata.points["transcripts"] = build_points(filtered_transcripts, gene_names_per_row, pixel_size)
     log_checkpoint(
-        f"Stage 3b: transcripts exact-filtered to polygon, kept in absolute coordinates "
+        f"Stage 3b: transcripts exact-filtered to polygon and shifted to local origin "
         f"({filtered_transcripts.number_rnas} kept)"
     )
 
