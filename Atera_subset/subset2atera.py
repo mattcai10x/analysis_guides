@@ -340,28 +340,25 @@ def crop_morphology_image(
         base_h, base_w = base_shape[y_ax], base_shape[x_ax]
 
         cropped_levels = []
-        for level in levels:
-            store = level.aszarr()
+        for i, level in enumerate(levels):
+            # NOTE(tifffile-zarr3): tifffile >=2026.5.2 rewrote ZarrTiffStore
+            # for zarr format 3 / NGFF 0.5. Calling .aszarr() on an individual
+            # per-level TiffPageSeries object with no level= kwarg does NOT
+            # give you just that level -- confirmed empirically: ZarrTiffStore
+            # reads self._data from `arg.levels`, which apparently returns the
+            # *same* full pyramid-level list regardless of which per-level
+            # object `arg` is, so every call produced a >1-level, NGFF
+            # multiscales *group* (9 numeric keys "0".."8" for this file's
+            # 9-level pyramid) rather than a bare per-level Array -- and
+            # `za[tuple(slice, ...)]` on a Group raises TypeError (expects a
+            # string key). ZarrTiffStore's own documented `level` parameter
+            # ("Pyramidal level to wrap") is exactly for this: passing it
+            # explicitly makes self._data a single-item list, which takes the
+            # non-multiscales path and returns a plain, directly-sliceable
+            # Array store -- matching the old (pre-2026.5.2) behavior exactly.
+            store = series.aszarr(level=i)
             try:
                 za = zarr.open(store, mode="r")
-                if isinstance(za, zarr.Group):
-                    # NOTE(tifffile-zarr3): tifffile >=2026.5.2 rewrote
-                    # ZarrTiffStore for zarr format 3 / NGFF 0.5 and now wraps
-                    # even a single pyramid level's store in an NGFF-style
-                    # group (confirmed: zarr.open() used to return a plain
-                    # Array here, directly sliceable; now it's a Group whose
-                    # sole child is the actual pixel array). Older tifffile
-                    # didn't do this -- if this ever sees more than one array
-                    # child, tifffile's per-level group layout changed again
-                    # and this needs a real look rather than guessing which
-                    # child is the pixel data.
-                    array_keys = list(za.array_keys())
-                    if len(array_keys) != 1:
-                        raise ValueError(
-                            "expected exactly one array in tifffile's per-level "
-                            f"zarr group, got {array_keys!r}"
-                        )
-                    za = za[array_keys[0]]
                 lvl_axes = level.axes
                 ly, lx = lvl_axes.index("Y"), lvl_axes.index("X")
                 lvl_h, lvl_w = level.shape[ly], level.shape[lx]
