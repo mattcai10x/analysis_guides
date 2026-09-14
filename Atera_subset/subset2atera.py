@@ -1166,11 +1166,33 @@ def main() -> None:
     # -- Stage 3a: SpatialData for the schema-compatible parts only --
     from spatialdata_io.readers.atera import atera as read_atera
 
-    # `scale_factors=None` skips building a multiscale image/labels pyramid: the
-    # whole point of this pipeline is that the cropped ROI is already small, so a
-    # multi-resolution pyramid is unlikely to be worth it (and a tiny crop can be
-    # too small to downsample at all, which would otherwise raise inside
-    # `multiscale_spatial_image`).
+    # `scale_factors=None` skips building a multiscale image/labels pyramid HERE:
+    # this `sdata` object is a throwaway intermediate used only for cell/nucleus
+    # boundary shapes and table sync (Stage 3b/3c below) -- its own image/label
+    # arrays are never written to the final bundle (the real morphology pyramid
+    # is written separately, directly, by `crop_morphology_image` -- see the
+    # module docstring), so building a multiscale pyramid for it would be wasted
+    # work regardless of how large the crop is; a tiny crop can also be too small
+    # to downsample at all, which would otherwise raise inside
+    # `multiscale_spatial_image`.
+    #
+    # `chunks=None`: works around a real bug in `spatialdata_io`'s own
+    # `_initialize_raster_models_kwargs` (confirmed by reading its source), which
+    # injects a default `chunks=(1, 4096, 4096)` -- a 3-tuple sized for a 2D
+    # `Image2DModel` ("c","y","x", 3 dims) -- into `image_models_kwargs`
+    # whenever the caller doesn't set one, and then reuses that SAME dict for
+    # `Image3DModel` ("c","z","y","x", 4 dims) too. `RasterSchema.parse()`
+    # positionally indexes that tuple once per dim (`chunks[index] for index,
+    # dim in enumerate(data.dims)`), so a 3D image crashes with `IndexError:
+    # tuple index out of range` (confirmed on a real run) the first time this
+    # reader is ever asked to load a real 3D morphology image with a channel
+    # axis -- this reader was apparently never exercised against one before.
+    # Passing `chunks=None` explicitly here is respected as "already set" by
+    # that injector (it only fills in a default when the key is absent), so it
+    # skips this whole positional-indexing path entirely; the images get
+    # explicitly rechunked to 1024x1024 by name (`{"c": -1, "y": ..., "x": ...}`,
+    # via dict -- which correctly ignores/tolerates a "z" dim it doesn't
+    # mention) right below anyway, so no chunking information is lost.
     sdata = read_atera(
         tmp_dir,
         cells_boundaries=True,
@@ -1182,8 +1204,8 @@ def main() -> None:
         transcripts=False,
         morphology_2d="morphology_2d" in stage2_files,
         morphology_3d="morphology_3d" in stage2_files,
-        image_models_kwargs={"scale_factors": None},
-        labels_models_kwargs={"scale_factors": None},
+        image_models_kwargs={"scale_factors": None, "chunks": None},
+        labels_models_kwargs={"scale_factors": None, "chunks": None},
     )
     log_checkpoint("Stage 3a: SpatialData built (images/labels/shapes only)")
 
