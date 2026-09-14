@@ -372,21 +372,17 @@ def crop_morphology_image(
     margin_px: float = 32.0,
     crop_window_px: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int]:
-    """Windowed crop of one (potentially pyramidal) OME-TIFF, without ever loading
-    a full resolution level into memory. Returns the level-0 (base-resolution)
-    pixel window actually used, as ``(x0, y0, x1, y1)`` -- this is the new local
-    pixel origin every other cropped element (cells, masks, transcripts) must be
-    made relative to, per the alignment fix described in this module's docstring.
+    """Windowed crop of an OME-TIFF's BASE (level-0) resolution only, without ever
+    loading the full resolution level into memory. Returns the level-0 pixel
+    window actually used, as ``(x0, y0, x1, y1)`` -- this is the new local pixel
+    origin every other cropped element (cells, masks, transcripts) must be made
+    relative to, per the alignment fix described in this module's docstring.
 
-    Shipped implementation: for each pyramid level present in the source series
-    (``TiffFile(...).series[0].levels``), open that level's zarr-store view via
-    ``.aszarr()``, compute the proportionally-scaled crop window for that level, and
-    slice only that window out (a tiled TIFF decodes only the touched tiles; a
-    stripped/non-tiled TIFF decodes only the touched scanlines -- either way, far
-    less than the whole level). All cropped levels are written back as a single
-    new *pyramidal* OME-TIFF (subimages appended as literal separate pages via
-    `tifffile.imwrite(..., data=[level0, level1, ...])`), preserving the same
-    number of resolution levels as the source.
+    Opens the source series' level-0 zarr-store view via ``.aszarr(level=0)`` and
+    slices only the crop window out of it (a tiled TIFF decodes only the touched
+    tiles; a stripped/non-tiled TIFF decodes only the touched scanlines -- either
+    way, far less than the whole level), then writes that single array back with
+    one plain ``tifffile.imwrite()`` call.
 
     ``crop_window_px``, if given, is the already-computed level-0 window (from
     :func:`_compute_crop_window_px`) to use instead of recomputing it from
@@ -396,124 +392,85 @@ def crop_morphology_image(
     it here, so there is exactly one source of truth for "where did the image
     actually get cropped."
 
-    Known gap vs. an ideal implementation: this does not re-derive OME-XML pyramid
-    metadata (`SubIFDs`, per-level `PhysicalSize*`, etc.) -- the levels are written
-    as plain sequential pages/series, which round-trips the pixel data and level
-    count but may not be recognized as a "true" OME pyramid by every downstream
-    tool. Memory cost of what is shipped: bounded by the crop window's pixel count
-    at each level (at most a few tens of MB for a typical ROI), never the full
-    slide (which is exactly the ~10s-of-GB-per-channel object this function exists
-    to avoid loading).
+    **Deliberately does NOT preserve the source's other pyramid levels** (an
+    earlier version of this function did, writing them as sequential TIFF pages
+    to "preserve the same number of resolution levels as the source" -- removed
+    after finding it fundamentally incompatible with how this cropped file is
+    actually consumed downstream, not just a cosmetic gap):
+
+    1. `subset2atera.py` always calls `spatialdata_io.readers.atera.atera()`
+       with `image_models_kwargs={"scale_factors": None}` (a cropped ROI is
+       already small; no multiscale pyramid is wanted), so nothing downstream
+       ever asks for more than one resolution level.
+    2. Both `_get_images` (2D) and `_get_morphology_3d_image` (3D) in
+       `spatialdata_io` read the file via `dask_image.imread.imread(path)`,
+       which has **no concept of pyramid levels at all** -- it just stacks
+       every PAGE in the file along a new leading axis, assuming each page is
+       a CHANNEL (2D) or Z-SLICE (3D) of one single-resolution image, all the
+       same shape. Handing it a file whose pages are actually
+       different-resolution pyramid levels is a real, confirmed bug: it
+       produces a wrong-shaped/wrong-ndim array, which crashed downstream
+       inside `Image3DModel.parse()` (`IndexError: tuple index out of range`,
+       the internal `chunks` tuple shorter than `data.dims`) the first time a
+       real 3D morphology image reached this reader.
+
+    Since nothing downstream ever wanted more than level 0 anyway, the fix is
+    to simply never write the other levels (and skip cropping/reading them
+    too, which is strictly less I/O than before) -- not to make the reader
+    pyramid-aware. This also sidesteps entirely the multi-page-TIFF
+    append/metadata saga a level-preserving version of this function used to
+    have to work around (see git history) -- level-0-only writes with a single
+    `tifffile.imwrite()` call and never reopens the file.
+
+    Known gap vs. an ideal implementation: since only one resolution level is
+    written, a real full OME pyramid is not reproduced -- by design, per the
+    above. Memory cost: bounded by the crop window's pixel count (at most a few
+    tens of MB for a typical ROI), never the full slide (which is exactly the
+    ~10s-of-GB-per-channel object this function exists to avoid loading).
     """
     import tifffile
 
     with tifffile.TiffFile(src_path) as tf:
         series = tf.series[0]
         levels = list(getattr(series, "levels", [series]))
-        base_shape = levels[0].shape
-        base_axes = levels[0].axes  # e.g. "YX", "CYX", "CZYX"
+        level0 = levels[0]
+        base_shape = level0.shape
+        base_axes = level0.axes  # e.g. "YX", "CYX", "CZYX"
         y_ax = base_axes.index("Y")
         x_ax = base_axes.index("X")
         base_h, base_w = base_shape[y_ax], base_shape[x_ax]
 
         if crop_window_px is None:
             crop_window_px = _compute_crop_window_px(base_h, base_w, bbox_px, margin_px)
-        base_x0, base_y0, base_x1, base_y1 = crop_window_px
+        x0, y0, x1, y1 = crop_window_px
 
-        cropped_levels = []
-        for i, level in enumerate(levels):
-            # NOTE(tifffile-zarr3): tifffile >=2026.5.2 rewrote ZarrTiffStore
-            # for zarr format 3 / NGFF 0.5. Calling .aszarr() on an individual
-            # per-level TiffPageSeries object with no level= kwarg does NOT
-            # give you just that level -- confirmed empirically: ZarrTiffStore
-            # reads self._data from `arg.levels`, which apparently returns the
-            # *same* full pyramid-level list regardless of which per-level
-            # object `arg` is, so every call produced a >1-level, NGFF
-            # multiscales *group* (9 numeric keys "0".."8" for this file's
-            # 9-level pyramid) rather than a bare per-level Array -- and
-            # `za[tuple(slice, ...)]` on a Group raises TypeError (expects a
-            # string key). ZarrTiffStore's own documented `level` parameter
-            # ("Pyramidal level to wrap") is exactly for this: passing it
-            # explicitly makes self._data a single-item list, which takes the
-            # non-multiscales path and returns a plain, directly-sliceable
-            # Array store -- matching the old (pre-2026.5.2) behavior exactly.
-            store = series.aszarr(level=i)
-            try:
-                za = zarr.open(store, mode="r")
-                lvl_axes = level.axes
-                ly, lx = lvl_axes.index("Y"), lvl_axes.index("X")
-                lvl_h, lvl_w = level.shape[ly], level.shape[lx]
-
-                if i == 0:
-                    # Use the precomputed/returned window verbatim (no
-                    # recompute-through-floats) so this is bit-identical to what
-                    # `stage2_crop` used to derive coord_offset/mask_bbox_px.
-                    x0, y0, x1, y1 = base_x0, base_y0, base_x1, base_y1
-                else:
-                    scale_y = lvl_h / base_h
-                    scale_x = lvl_w / base_w
-                    y0 = max(0, int(np.floor(base_y0 * scale_y)))
-                    y1 = min(lvl_h, int(np.ceil(base_y1 * scale_y)))
-                    x0 = max(0, int(np.floor(base_x0 * scale_x)))
-                    x1 = min(lvl_w, int(np.ceil(base_x1 * scale_x)))
-                    y0, y1 = min(y0, y1), max(y0, y1)
-                    x0, x1 = min(x0, x1), max(x0, x1)
-                    y1, x1 = max(y1, y0 + 1), max(x1, x0 + 1)
-
-                sl = [slice(None)] * len(lvl_axes)
-                sl[ly] = slice(y0, y1)
-                sl[lx] = slice(x0, x1)
-                cropped_levels.append(np.asarray(za[tuple(sl)]))
-            finally:
-                if hasattr(store, "close"):
-                    store.close()
+        # NOTE(tifffile-zarr3): tifffile >=2026.5.2 rewrote ZarrTiffStore for
+        # zarr format 3 / NGFF 0.5. Calling .aszarr() with no level= kwarg does
+        # NOT give you just level 0 -- confirmed empirically: ZarrTiffStore
+        # reads self._data from `arg.levels`, which returns the *same* full
+        # pyramid-level list regardless of which per-level object `arg` is, so
+        # it produced a >1-level, NGFF multiscales *group* rather than a bare
+        # Array -- and `za[tuple(slice, ...)]` on a Group raises TypeError
+        # (expects a string key). ZarrTiffStore's own documented `level`
+        # parameter ("Pyramidal level to wrap") is exactly for this: passing
+        # it explicitly makes self._data a single-item list, which takes the
+        # non-multiscales path and returns a plain, directly-sliceable Array
+        # store -- matching the old (pre-2026.5.2) behavior exactly.
+        store = series.aszarr(level=0)
+        try:
+            za = zarr.open(store, mode="r")
+            sl = [slice(None)] * len(base_axes)
+            sl[y_ax] = slice(y0, y1)
+            sl[x_ax] = slice(x0, x1)
+            cropped = np.asarray(za[tuple(sl)])
+        finally:
+            if hasattr(store, "close"):
+                store.close()
 
     os.makedirs(os.path.dirname(os.path.abspath(dst_path)) or ".", exist_ok=True)
-    if len(cropped_levels) == 1:
-        tifffile.imwrite(dst_path, cropped_levels[0], photometric="minisblack")
-    else:
-        # Sequential pages, one per (cropped) pyramid level. See docstring: this
-        # preserves level count/pixels, not full OME pyramid SubIFD metadata.
-        #
-        # NOTE(tifffile-zarr3, superseded fix): an earlier version of this
-        # code wrote level 0 via a plain `imwrite()`, closing the file, then
-        # reopened it with `TiffWriter(dst_path, append=True)` to add the
-        # remaining levels. Newer tifffile (confirmed on a version after
-        # 2026.5.2) raises "cannot append to file containing metadata" on
-        # that reopen -- and passing `metadata=None` to the first `imwrite()`
-        # did NOT avoid it: `is_appendable`'s exact definition has changed
-        # across tifffile versions/is defined deep in a >2600-line function
-        # this session couldn't fully fetch, so patching around whatever
-        # check a given tifffile release happens to run is fragile and kept
-        # breaking again on version bumps.
-        #
-        # The robust fix is to never close and reopen the file at all: keep
-        # ONE `TiffWriter` session open (no `append=True`, so the "is this
-        # existing file safe to extend" check -- whatever it currently does
-        # -- is never invoked in the first place) and call `.write()` once
-        # per level before closing. This is tifffile's normal, intended
-        # pattern for a multi-page file with heterogeneously-shaped pages
-        # (e.g. a pyramid), and has no version-dependent append-safety logic
-        # to keep up with.
-        #
-        # `metadata=None` on the FIRST `.write()` call only (confirmed
-        # empirically, against locally-installed tifffile 2025.5.10): without
-        # it, tifffile's default embedded "shaped" metadata on page 0 makes
-        # each differently-shaped page read back as its OWN separate
-        # single-level `series` instead of one `series` with N `.levels` --
-        # i.e. writing without `metadata=None` silently drops the "this is a
-        # pyramid" structure `crop_morphology_image`'s own re-read logic
-        # (`series.aszarr(level=i)`) and downstream consumers
-        # (`spatialdata_io`/ziggy) rely on `series[0].levels` for. Passing it
-        # again on later `.write()` calls isn't necessary (verified: same
-        # grouped-series-with-levels result either way), so it's only passed
-        # once here to be minimal.
-        with tifffile.TiffWriter(dst_path) as tw:
-            tw.write(cropped_levels[0], photometric="minisblack", metadata=None)
-            for lvl in cropped_levels[1:]:
-                tw.write(lvl, photometric="minisblack")
+    tifffile.imwrite(dst_path, cropped, photometric="minisblack")
 
-    return base_x0, base_y0, base_x1, base_y1
+    return x0, y0, x1, y1
 
 
 def maybe_crop_binned_transcripts(src: str, dst: str, bbox, skip: bool) -> bool:
