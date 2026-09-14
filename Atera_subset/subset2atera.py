@@ -98,6 +98,28 @@
 #      omit it anyway (e.g. if ziggy's density view isn't needed for a given
 #      use case and you'd rather skip the extra I/O).
 #
+# --------------------------------------------------------------------------------
+# COORDINATE ALIGNMENT: everything is relative to the cropped image's local origin
+# --------------------------------------------------------------------------------
+# The cropped morphology image is written at LOCAL pixel origin (0, 0) -- there is
+# no field anywhere in this toolchain (the experiment.spatial manifest schema, the
+# OME-XML, or spatialdata_io's atera() reader, which hard-codes an Identity()
+# transform) to instead record the crop's absolute (min_x, min_y) offset. So this
+# script shifts every OTHER coordinate (transcript x/y, cell/nucleus centroids,
+# per-cell bboxes, polygon vertices, and the /masks pixel rasters) to be relative
+# to that same local origin, which is computed ONCE in `stage2_crop` (as the exact
+# level-0 pixel window `crop_morphology_image` will use, via
+# `_compute_crop_window_px` -- this already accounts for `crop_morphology_image`'s
+# `margin_px` padding and edge clamping, not just the raw GeoJSON bbox) and
+# threaded through: `crop_cells_by_ids`'s `coord_offset`/`mask_bbox_px` params
+# (Stage 2b) shift/crop cells.zarr.zip, and `filter_transcripts_to_polygon`'s
+# `coord_offset` param (Stage 3b) shifts transcripts after exact polygon
+# filtering (which must stay in absolute-micron space to match the still-absolute
+# `target_polygon`). This shift must be applied EXACTLY ONCE per absolute-origin
+# source -- the Stage 3d "sync dropped more cells" re-crop (a second
+# `crop_cells_by_ids` call, operating on the ALREADY-shifted Stage 2 output) does
+# NOT pass these params again, on purpose.
+#
 # Stage 3 (small data now -- safe to fully materialize):
 #   a. `spatialdata_io.atera()` on the Stage-2 bundle for images/labels/shapes only.
 #   b. Exact polygon (not bbox) filtering of the cropped transcripts (cheap now).
@@ -106,9 +128,10 @@
 #      against the kept cell/nucleus boundaries, mirroring `subset2zarr.py` step 5.
 #   d. Write the final bundle: transcripts.zarr.zip and the cell-feature matrices
 #      via `atera_dataset_tools` (real schema); cells.zarr.zip and morphology
-#      images are the already-correct Stage-2 intermediates (re-cropped only if
-#      the sync step in 3c dropped anything further, which should not normally
-#      happen since Stage 1 was already exact).
+#      images are the already-correct, already-local-origin-shifted Stage-2
+#      intermediates (re-cropped, WITHOUT re-shifting, only if the sync step in
+#      3c dropped anything further, which should not normally happen since
+#      Stage 1 was already exact -- see the coordinate-alignment note below).
 #   e. Patch `experiment.spatial` with copied-forward manifest fields + recomputed
 #      `num_cells`/`transcripts_per_cell`/`num_transcripts`/`num_transcripts_high_quality`.
 #   f. Optional full zarr dump of the final small `SpatialData` object (`-z/--zarr_out`).
@@ -294,14 +317,66 @@ def _skip_if_present(dst: str, force: bool) -> bool:
     return os.path.exists(dst)
 
 
+def _compute_crop_window_px(
+    base_h: int, base_w: int, bbox_px: tuple[float, float, float, float], margin_px: float = 32.0
+) -> tuple[int, int, int, int]:
+    """Pure pixel-bbox-to-window math shared by ``crop_morphology_image`` and its
+    caller (``stage2_crop``, which needs the *exact same* level-0 window to derive
+    ``coord_offset``/``mask_bbox_px`` for the cells crop -- see there). Returns
+    ``(x0, y0, x1, y1)`` at level-0 (base) resolution, after applying ``margin_px``
+    and clamping to ``[0, base_w]``/``[0, base_h]``.
+    """
+    min_x, min_y, max_x, max_y = bbox_px
+    min_x -= margin_px
+    min_y -= margin_px
+    max_x += margin_px
+    max_y += margin_px
+
+    y0 = max(0, int(np.floor(min_y)))
+    y1 = min(base_h, int(np.ceil(max_y)))
+    x0 = max(0, int(np.floor(min_x)))
+    x1 = min(base_w, int(np.ceil(max_x)))
+    y0, y1 = min(y0, y1), max(y0, y1)
+    x0, x1 = min(x0, x1), max(x0, x1)
+    y1, x1 = max(y1, y0 + 1), max(x1, x0 + 1)
+    return x0, y0, x1, y1
+
+
+def get_base_level_shape(src_path: str) -> tuple[int, int]:
+    """Return ``(base_h, base_w)`` for an OME-TIFF's level-0 (base) resolution.
+
+    Only reads TIFF/OME-XML header metadata (page shapes/axes) -- never decodes
+    any pixel data -- so this is cheap to call independently of an actual crop,
+    which is what ``stage2_crop`` needs: it must know the *exact* level-0 crop
+    window ``crop_morphology_image`` will use (accounting for ``margin_px`` and
+    edge clamping) before deciding ``coord_offset``/``mask_bbox_px`` for the
+    cells crop, even when the image crop itself is skipped via ``--force-redo``'s
+    resume path.
+    """
+    import tifffile
+
+    with tifffile.TiffFile(src_path) as tf:
+        series = tf.series[0]
+        levels = list(getattr(series, "levels", [series]))
+        base_shape = levels[0].shape
+        base_axes = levels[0].axes  # e.g. "YX", "CYX", "CZYX"
+        y_ax = base_axes.index("Y")
+        x_ax = base_axes.index("X")
+        return base_shape[y_ax], base_shape[x_ax]
+
+
 def crop_morphology_image(
     src_path: str,
     dst_path: str,
     bbox_px: tuple[float, float, float, float],
     margin_px: float = 32.0,
-) -> None:
+    crop_window_px: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
     """Windowed crop of one (potentially pyramidal) OME-TIFF, without ever loading
-    a full resolution level into memory.
+    a full resolution level into memory. Returns the level-0 (base-resolution)
+    pixel window actually used, as ``(x0, y0, x1, y1)`` -- this is the new local
+    pixel origin every other cropped element (cells, masks, transcripts) must be
+    made relative to, per the alignment fix described in this module's docstring.
 
     Shipped implementation: for each pyramid level present in the source series
     (``TiffFile(...).series[0].levels``), open that level's zarr-store view via
@@ -312,6 +387,14 @@ def crop_morphology_image(
     new *pyramidal* OME-TIFF (subimages appended as literal separate pages via
     `tifffile.imwrite(..., data=[level0, level1, ...])`), preserving the same
     number of resolution levels as the source.
+
+    ``crop_window_px``, if given, is the already-computed level-0 window (from
+    :func:`_compute_crop_window_px`) to use instead of recomputing it from
+    ``bbox_px``/``margin_px`` -- callers that also need the window for other
+    purposes (``stage2_crop``, to align the cells crop) should compute it once
+    via :func:`get_base_level_shape` + :func:`_compute_crop_window_px` and pass
+    it here, so there is exactly one source of truth for "where did the image
+    actually get cropped."
 
     Known gap vs. an ideal implementation: this does not re-derive OME-XML pyramid
     metadata (`SubIFDs`, per-level `PhysicalSize*`, etc.) -- the levels are written
@@ -324,12 +407,6 @@ def crop_morphology_image(
     """
     import tifffile
 
-    min_x, min_y, max_x, max_y = bbox_px
-    min_x -= margin_px
-    min_y -= margin_px
-    max_x += margin_px
-    max_y += margin_px
-
     with tifffile.TiffFile(src_path) as tf:
         series = tf.series[0]
         levels = list(getattr(series, "levels", [series]))
@@ -338,6 +415,10 @@ def crop_morphology_image(
         y_ax = base_axes.index("Y")
         x_ax = base_axes.index("X")
         base_h, base_w = base_shape[y_ax], base_shape[x_ax]
+
+        if crop_window_px is None:
+            crop_window_px = _compute_crop_window_px(base_h, base_w, bbox_px, margin_px)
+        base_x0, base_y0, base_x1, base_y1 = crop_window_px
 
         cropped_levels = []
         for i, level in enumerate(levels):
@@ -362,16 +443,22 @@ def crop_morphology_image(
                 lvl_axes = level.axes
                 ly, lx = lvl_axes.index("Y"), lvl_axes.index("X")
                 lvl_h, lvl_w = level.shape[ly], level.shape[lx]
-                scale_y = lvl_h / base_h
-                scale_x = lvl_w / base_w
 
-                y0 = max(0, int(np.floor(min_y * scale_y)))
-                y1 = min(lvl_h, int(np.ceil(max_y * scale_y)))
-                x0 = max(0, int(np.floor(min_x * scale_x)))
-                x1 = min(lvl_w, int(np.ceil(max_x * scale_x)))
-                y0, y1 = min(y0, y1), max(y0, y1)
-                x0, x1 = min(x0, x1), max(x0, x1)
-                y1, x1 = max(y1, y0 + 1), max(x1, x0 + 1)
+                if i == 0:
+                    # Use the precomputed/returned window verbatim (no
+                    # recompute-through-floats) so this is bit-identical to what
+                    # `stage2_crop` used to derive coord_offset/mask_bbox_px.
+                    x0, y0, x1, y1 = base_x0, base_y0, base_x1, base_y1
+                else:
+                    scale_y = lvl_h / base_h
+                    scale_x = lvl_w / base_w
+                    y0 = max(0, int(np.floor(base_y0 * scale_y)))
+                    y1 = min(lvl_h, int(np.ceil(base_y1 * scale_y)))
+                    x0 = max(0, int(np.floor(base_x0 * scale_x)))
+                    x1 = min(lvl_w, int(np.ceil(base_x1 * scale_x)))
+                    y0, y1 = min(y0, y1), max(y0, y1)
+                    x0, x1 = min(x0, x1), max(x0, x1)
+                    y1, x1 = max(y1, y0 + 1), max(x1, x0 + 1)
 
                 sl = [slice(None)] * len(lvl_axes)
                 sl[ly] = slice(y0, y1)
@@ -406,6 +493,8 @@ def crop_morphology_image(
             for lvl in cropped_levels[1:]:
                 tw.write(lvl, photometric="minisblack")
 
+    return base_x0, base_y0, base_x1, base_y1
+
 
 def maybe_crop_binned_transcripts(src: str, dst: str, bbox, skip: bool) -> bool:
     """Returns True if a binned_transcripts.zarr.zip was written to dst.
@@ -438,6 +527,48 @@ def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp
     images_manifest = manifest.get(IMAGES_KEY, {})
     out = {}
 
+    # -- coordinate-alignment fix: compute the local origin every other cropped
+    #    element must be shifted to, BEFORE cropping cells (below) or transcripts
+    #    (Stage 3b) -- see this module's docstring and atera_dataset_tools.crop's
+    #    docstring for the full rationale (a cropped morphology image is written
+    #    at local pixel origin (0, 0), with no manifest/OME-XML field anywhere in
+    #    this toolchain to instead record the crop's absolute offset, so instead
+    #    everything else gets shifted to match the image).
+    #
+    #    The local origin is the EXACT level-0 pixel window `crop_morphology_image`
+    #    will use for whichever morphology image is present (it pads `bbox_px` by
+    #    a `margin_px` and clamps to the image bounds -- not just the raw GeoJSON
+    #    bbox), so that window is computed once here via the same pure helper
+    #    (`_compute_crop_window_px`) and threaded through to both the cells crop
+    #    below and the image crop(s) later in this function, guaranteeing they
+    #    agree on pixel-for-pixel the same origin.
+    #
+    #    If no morphology image is present at all (no image to align pixel masks
+    #    to), fall back to the plain GeoJSON bbox with no margin -- cells/masks
+    #    still get a consistent local origin, just not one tied to an image crop
+    #    window that doesn't exist.
+    pixel_size = float(manifest["pixel_size"])
+    bbox_px = tuple(v / pixel_size for v in bbox)
+    base_image_key = MORPHOLOGY_2D_KEY if MORPHOLOGY_2D_KEY in images_manifest else (
+        MORPHOLOGY_3D_KEY if MORPHOLOGY_3D_KEY in images_manifest else None
+    )
+    if base_image_key is not None:
+        base_h, base_w = get_base_level_shape(os.path.join(input_dir, images_manifest[base_image_key]))
+        crop_window_px = _compute_crop_window_px(base_h, base_w, bbox_px)
+    else:
+        crop_window_px = (
+            max(0, int(np.floor(bbox_px[0]))),
+            max(0, int(np.floor(bbox_px[1]))),
+            max(1, int(np.ceil(bbox_px[2]))),
+            max(1, int(np.ceil(bbox_px[3]))),
+        )
+    coord_offset = (crop_window_px[0] * pixel_size, crop_window_px[1] * pixel_size)
+    out["coord_offset"] = coord_offset
+    log_checkpoint(
+        f"Stage 2 setup: local origin = pixel {crop_window_px[:2]} "
+        f"(microns {coord_offset}) -- every cropped coordinate will be relative to this"
+    )
+
     # -- transcripts.zarr.zip: tile-level bbox prefilter --
     src = os.path.join(input_dir, explorer_files[TRANSCRIPTS_ZARR_KEY])
     dst = os.path.join(tmp_dir, "transcripts.zarr.zip")
@@ -449,16 +580,19 @@ def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp
     log_checkpoint("Stage 2a: transcripts.zarr.zip cropped to bbox tiles")
 
     # -- cells.zarr.zip: exact cell crop, selected by row index (unambiguous;
-    #    see the module-level note on cell-ID string conventions) --
+    #    see the module-level note on cell-ID string conventions) -- shifted to
+    #    the local origin computed above, with masks spatially cropped to match. --
     keep_row_tokens = [str(int(r)) for r in keep_rows]
     src = os.path.join(input_dir, explorer_files[CELLS_ZARR_KEY])
     dst = os.path.join(tmp_dir, "cells.zarr.zip")
     if not _skip_if_present(dst, args.force_redo):
-        adt_crop.crop_cells_by_ids(src, dst, keep_row_tokens)
+        adt_crop.crop_cells_by_ids(
+            src, dst, keep_row_tokens, coord_offset=coord_offset, mask_bbox_px=crop_window_px
+        )
     else:
         print(f"  [resume] {dst} already exists, skipping re-crop")
     out["cells"] = dst
-    log_checkpoint("Stage 2b: cells.zarr.zip cropped to exact keep_rows")
+    log_checkpoint("Stage 2b: cells.zarr.zip cropped to exact keep_rows, shifted to local origin")
 
     # -- cell_feature_matrix.zarr.zip (CSR), then csc_* (CSC) -- sequentially --
     # `subset_cell_feature_matrix` matches by obs-index *string*, not row index,
@@ -488,9 +622,10 @@ def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp
         out["csc_cell_feature_matrix"] = dst
         log_checkpoint("Stage 2c: csc_cell_feature_matrix.zarr.zip (CSC) subset")
 
-    # -- morphology images: windowed pyramid crop --
-    pixel_size = float(manifest["pixel_size"])
-    bbox_px = tuple(v / pixel_size for v in bbox)
+    # -- morphology images: windowed pyramid crop, using the SAME crop_window_px
+    #    computed above (so the image's actual local origin can never drift from
+    #    what cells/masks were already shifted to, even across a --force-redo of
+    #    just one of the two images vs. cells). --
     for key, out_key in ((MORPHOLOGY_2D_KEY, "morphology_2d"), (MORPHOLOGY_3D_KEY, "morphology_3d")):
         if key not in images_manifest:
             continue
@@ -498,12 +633,23 @@ def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp
         src = os.path.join(input_dir, rel)
         dst = os.path.join(tmp_dir, rel)
         if not _skip_if_present(dst, args.force_redo):
-            crop_morphology_image(src, dst, bbox_px)
+            used_window = crop_morphology_image(src, dst, bbox_px, crop_window_px=crop_window_px)
+            if used_window != crop_window_px:
+                # Can only happen if morphology_2d/morphology_3d have different
+                # base resolutions (not expected -- both should share the same
+                # pixel grid/pixel_size per the manifest) -- surface it loudly
+                # rather than silently shipping a misaligned second image.
+                raise RuntimeError(
+                    f"{key} crop window {used_window} != local origin {crop_window_px} "
+                    "computed from the first morphology image -- morphology_2d and "
+                    "morphology_3d appear to have different base resolutions, which "
+                    "this pipeline assumes never happens."
+                )
         else:
             print(f"  [resume] {dst} already exists, skipping re-crop")
         out[out_key] = dst
         out[out_key + "_rel"] = rel
-    log_checkpoint("Stage 2d: morphology image(s) windowed-cropped")
+    log_checkpoint("Stage 2d: morphology image(s) windowed-cropped to local origin")
 
     # -- binned_transcripts.zarr.zip: skipped by default --
     if TRANSCRIPTS_VIZ_ZARR_KEY in explorer_files:
@@ -541,16 +687,35 @@ def _resolve_gene_names(t: "adt_transcripts.Transcripts") -> np.ndarray:
     return gene_names[gene_ix]
 
 
-def filter_transcripts_to_polygon(cropped_transcripts_path: str, target_polygon):
+def filter_transcripts_to_polygon(
+    cropped_transcripts_path: str, target_polygon, coord_offset: tuple[float, float] | None = None
+):
     """Read the (already tile-bbox-cropped, small) transcripts.zarr.zip and keep
     only the transcripts whose exact (x, y) fall inside `target_polygon`.
     Returns the filtered `Transcripts` dataclass and the resolved gene-name array
     (aligned to the *filtered* rows) for downstream reuse (points df + metrics).
+
+    `target_polygon` is in ABSOLUTE microns (Stage 0's original, unshifted
+    polygon), matching the still-absolute coordinates in `cropped_transcripts_path`
+    at this point -- so containment filtering happens first, in absolute space.
+    `coord_offset`, if given, is applied AFTER filtering: every kept transcript's
+    (x, y) is shifted by `-coord_offset` to match the local origin the cropped
+    morphology image and `cells.zarr.zip` (see `stage2_crop`) were already shifted
+    to. Passing the same `target_polygon` used for Stage 1's cell selection but a
+    mismatched/missing `coord_offset` here would silently misalign transcripts
+    against everything else in the output bundle.
     """
     from shapely import vectorized
 
     t = adt_transcripts.read(cropped_transcripts_path)
     mask = vectorized.contains(target_polygon, t.x_position.astype(np.float64), t.y_position.astype(np.float64))
+
+    x_position = t.x_position[mask]
+    y_position = t.y_position[mask]
+    if coord_offset is not None:
+        ox, oy = coord_offset
+        x_position = x_position - ox
+        y_position = y_position - oy
 
     filtered = adt_transcripts.Transcripts(
         number_genes=t.number_genes,
@@ -560,8 +725,8 @@ def filter_transcripts_to_polygon(cropped_transcripts_path: str, target_polygon)
         codeword_gene_names=t.codeword_gene_names,
         codeword_category=t.codeword_category,
         gene_category=t.gene_category,
-        x_position=t.x_position[mask],
-        y_position=t.y_position[mask],
+        x_position=x_position,
+        y_position=y_position,
         z_position=t.z_position[mask],
         quality_score=t.quality_score[mask],
         codeword_index=t.codeword_index[mask],
@@ -829,13 +994,16 @@ def main() -> None:
     )
     log_checkpoint("Stage 3a: SpatialData built (images/labels/shapes only)")
 
-    # -- Stage 3b: exact polygon filter on transcripts (cheap: already tile-cropped) --
+    # -- Stage 3b: exact polygon filter on transcripts (cheap: already tile-cropped),
+    #    then shift to the same local origin cells.zarr.zip and the morphology
+    #    image(s) were already shifted to in Stage 2 (see stage2_crop). --
+    coord_offset = stage2_files["coord_offset"]
     filtered_transcripts, gene_names_per_row = filter_transcripts_to_polygon(
-        stage2_files["transcripts"], target_polygon
+        stage2_files["transcripts"], target_polygon, coord_offset=coord_offset
     )
     sdata.points["transcripts"] = build_points(filtered_transcripts, gene_names_per_row, pixel_size)
     log_checkpoint(
-        f"Stage 3b: transcripts exact-filtered to polygon "
+        f"Stage 3b: transcripts exact-filtered to polygon and shifted to local origin "
         f"({filtered_transcripts.number_rnas} kept)"
     )
 
