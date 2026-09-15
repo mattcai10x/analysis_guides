@@ -1023,6 +1023,7 @@ _BINNED_TRANSCRIPTS_MIN_QUALITY = 20
 def build_binned_transcripts_from_points(
     filtered_transcripts: "adt_transcripts.Transcripts",
     gene_names_per_row: np.ndarray,
+    grid_size: float,
     bin_size: float,
 ) -> "adt_binned_transcripts.BinnedTranscripts":
     """Regenerate `binned_transcripts.zarr.zip`'s density data directly from
@@ -1036,44 +1037,66 @@ def build_binned_transcripts_from_points(
     visible when zoomed far out in ziggy.
 
     Only `quality_score >= 20` transcripts are counted, matching this
-    format's own documented occupancy convention. Every surviving transcript
-    is binned into a SINGLE tile at local grid index (0, 0): the whole point
-    of a crop is that its extent is small, so there is no need to replicate
-    the source file's multi-tile absolute grid here -- one square tile sized
-    to just cover the filtered extent is enough, and keeps this function
-    simple. `bin_size` (microns per bin) is carried over from the SOURCE
-    file (via `adt_binned_transcripts.read_grid_shape`) purely so the
-    regenerated raster has the same visual resolution as the un-cropped
-    file; it is NOT re-derived from the crop's own size.
+    format's own documented occupancy convention.
+
+    Per the binned_transcripts.zarr.zip spec, the tile grid must use "the
+    tile footprint transcripts.zarr.zip also uses" -- so `grid_size` here
+    MUST be the same value written to the (already-cropped) output
+    transcripts.zarr.zip (copied through verbatim from source; see the
+    caller), not a value fitted to the crop's own extent. `rows`/`cols` (the
+    fixed pixel resolution of every tile, "identical for every tile in the
+    archive" per spec) then follows as `round(grid_size / bin_size)`, where
+    `bin_size` (microns/pixel) is peeked from the SOURCE binned_transcripts
+    file (`adt_binned_transcripts.read_grid_shape`) so the regenerated
+    raster keeps the same visual resolution as the un-cropped file.
+
+    Transcripts are assigned to a tile the same way the rest of this
+    toolchain's grid-keyed formats do: `floor(local_x / grid_size),
+    floor(local_y / grid_size)`. A crop is usually much smaller than one
+    tile's footprint, so this is normally a single tile at local index
+    (0, 0) -- but a crop whose local extent exceeds one tile (a large
+    polygon, or one that happens to straddle a grid line even after
+    shifting) is handled correctly rather than silently mis-binned into a
+    single oversized tile.
 
     Returns a valid (possibly all-empty, if nothing survives the quality
     filter) `BinnedTranscripts` -- `write()` handles a `genes={}` dict fine,
     it just emits no `gene/` entries, matching the format's normal sparse-gene
     semantics for a dataset with no occupied genes at all.
     """
+    rows_f = grid_size / bin_size
+    rows = cols = max(1, int(round(rows_f)))
+    if abs(rows_f - rows) > 1e-3:
+        print(
+            f"  [binned_transcripts] warning: grid_size ({grid_size}) is not an exact "
+            f"multiple of the source bin_size ({bin_size}); rounding tile resolution to "
+            f"{rows}x{rows} pixels (off by {rows_f - rows:+.4f} pixels)."
+        )
+
     t = filtered_transcripts
     keep = t.quality_score >= _BINNED_TRANSCRIPTS_MIN_QUALITY
 
     if not np.any(keep):
         return adt_binned_transcripts.BinnedTranscripts(
-            gene_names=list(t.gene_names), origin={"x": 0.0, "y": 0.0}, grid_size=bin_size, genes={},
+            gene_names=list(t.gene_names), origin={"x": 0.0, "y": 0.0}, grid_size=grid_size, genes={},
         )
 
     # Local origin is already (0, 0) by construction (filtered_transcripts
     # was already shifted in Stage 3b) -- clip any tiny negative
     # floating-point noise at the edge rather than letting it produce a
-    # negative bin index below.
+    # negative tile/bin index below.
     x = np.clip(t.x_position[keep].astype(np.float64), 0.0, None)
     y = np.clip(t.y_position[keep].astype(np.float64), 0.0, None)
     gene_names_kept = np.asarray(gene_names_per_row)[keep]
 
-    max_extent = float(max(x.max(initial=0.0), y.max(initial=0.0)))
-    # One square tile, sized (in whole bins) to cover every kept transcript --
-    # square because this format only stores a single `grid_size` (root attr)
-    # shared by both axes, so `bin_size = grid_size / rows` is only
-    # well-defined if rows == cols (see `read_grid_shape`'s docstring).
-    n_bins = max(1, int(np.ceil((max_extent + 1e-6) / bin_size)))
-    grid_size = n_bins * bin_size
+    tile_x = np.floor(x / grid_size).astype(np.int64)
+    tile_y = np.floor(y / grid_size).astype(np.int64)
+    # Position WITHIN its tile, in pixels -- (rows, cols) convention matches
+    # the rest of this toolchain's pixel rasters: rows=y, cols=x (see
+    # atera_dataset_tools.crop's mask-crop docstring; also matches this
+    # format's own "indices ... column (pixel x) index" spec wording).
+    col_idx = np.clip(np.floor((x - tile_x * grid_size) / bin_size).astype(np.int64), 0, cols - 1)
+    row_idx = np.clip(np.floor((y - tile_y * grid_size) / bin_size).astype(np.int64), 0, rows - 1)
 
     gene_name_to_index = {name: i for i, name in enumerate(t.gene_names)}
 
@@ -1088,18 +1111,20 @@ def build_binned_transcripts_from_points(
         gene_index = gene_name_to_index.get(str(gene_name))
         if gene_index is None:
             continue
-        row_mask = gene_names_kept == gene_name
-        col_idx = np.clip(np.floor(x[row_mask] / bin_size).astype(np.int64), 0, n_bins - 1)
-        row_idx = np.clip(np.floor(y[row_mask] / bin_size).astype(np.int64), 0, n_bins - 1)
-        # (rows, cols) convention matches the rest of this toolchain's pixel
-        # rasters: rows=y, cols=x (see atera_dataset_tools.crop's mask-crop
-        # docstring). One transcript per row_mask entry -> value 1, summed at
-        # colliding (row, col) pairs by tocsr()'s duplicate-index handling.
-        counts = scipy.sparse.coo_matrix(
-            (np.ones(int(row_mask.sum()), dtype=np.uint16), (row_idx, col_idx)),
-            shape=(n_bins, n_bins),
-        ).tocsr()
-        genes[gene_index] = adt_binned_transcripts.GeneTiles(rows=n_bins, cols=n_bins, tiles={(0, 0): counts})
+        gmask = gene_names_kept == gene_name
+        g_tile_x, g_tile_y = tile_x[gmask], tile_y[gmask]
+        g_col, g_row = col_idx[gmask], row_idx[gmask]
+
+        g = adt_binned_transcripts.GeneTiles(rows=rows, cols=cols)
+        for tx, ty in {(int(a), int(b)) for a, b in zip(g_tile_x, g_tile_y)}:
+            tmask = (g_tile_x == tx) & (g_tile_y == ty)
+            # One transcript per tmask entry -> value 1, summed at colliding
+            # (row, col) pairs by tocsr()'s duplicate-index handling.
+            g.tiles[(tx, ty)] = scipy.sparse.coo_matrix(
+                (np.ones(int(tmask.sum()), dtype=np.uint16), (g_row[tmask], g_col[tmask])),
+                shape=(rows, cols),
+            ).tocsr()
+        genes[gene_index] = g
 
     return adt_binned_transcripts.BinnedTranscripts(
         gene_names=list(t.gene_names), origin={"x": 0.0, "y": 0.0}, grid_size=grid_size, genes=genes,
@@ -1322,6 +1347,10 @@ def main() -> None:
         stage2_files["transcripts"], target_polygon, coord_offset=coord_offset
     )
     sdata.points["transcripts"] = build_points(filtered_transcripts, gene_names_per_row, pixel_size)
+    # Read once here, reused below for binned_transcripts AND in Stage 3d for
+    # the final transcripts.zarr.zip write -- both must use the exact same
+    # `grid_size` (see the binned_transcripts note right below).
+    transcripts_grid_size = float(adt_transcripts.read_grid_attrs(stage2_files["transcripts"])["grid_size"])
     log_checkpoint(
         f"Stage 3b: transcripts exact-filtered to polygon and shifted to local origin "
         f"({filtered_transcripts.number_rnas} kept)"
@@ -1331,10 +1360,14 @@ def main() -> None:
     #    the module docstring's Stage 2e note) directly from the
     #    already-filtered, already-shifted `filtered_transcripts` above, so it
     #    lands at the same local origin as everything else instead of the
-    #    original file's absolute coordinates. `bin_size` is peeked cheaply
-    #    from the ORIGINAL source file (root attrs + one gene's grid attrs
-    #    only -- see `read_grid_shape`), not from the Stage-2 tmp dir, since
-    #    Stage 2 no longer produces a binned_transcripts intermediate at all.
+    #    original file's absolute coordinates. Per the format's spec, its
+    #    tile grid must use "the tile footprint transcripts.zarr.zip also
+    #    uses" -- hence `grid_size=transcripts_grid_size` below, NOT a value
+    #    sized to the crop's own extent. `bin_size` (pixel resolution) is
+    #    peeked cheaply from the ORIGINAL source file (root attrs + one
+    #    gene's grid attrs only -- see `read_grid_shape`), not from the
+    #    Stage-2 tmp dir, since Stage 2 no longer produces a
+    #    binned_transcripts intermediate at all.
     binned_transcripts_written = False
     if TRANSCRIPTS_VIZ_ZARR_KEY in manifest[EXPLORER_FILES_KEY] and not args.skip_binned_transcripts:
         src_binned = os.path.join(args.input, manifest[EXPLORER_FILES_KEY][TRANSCRIPTS_VIZ_ZARR_KEY])
@@ -1345,7 +1378,7 @@ def main() -> None:
         else:
             bin_size = grid_shape["grid_size"] / grid_shape["rows"]
             binned_transcripts = build_binned_transcripts_from_points(
-                filtered_transcripts, gene_names_per_row, bin_size
+                filtered_transcripts, gene_names_per_row, grid_size=transcripts_grid_size, bin_size=bin_size
             )
             binned_transcripts_out_path = os.path.join(args.output, "binned_transcripts.zarr.zip")
             adt_binned_transcripts.write(binned_transcripts_out_path, binned_transcripts)
@@ -1412,10 +1445,12 @@ def main() -> None:
             )
 
     # transcripts.zarr.zip: write the exact-polygon-filtered Transcripts directly.
-    grid_attrs = adt_transcripts.read_grid_attrs(stage2_files["transcripts"])
+    # `grid_size` is `transcripts_grid_size` (read once, back in Stage 3b) --
+    # the SAME value binned_transcripts.zarr.zip's tile grid was just built
+    # against, per that format's "same tile footprint" requirement.
     adt_transcripts.write(
         os.path.join(args.output, "transcripts.zarr.zip"), filtered_transcripts,
-        grid_size=float(grid_attrs["grid_size"]),
+        grid_size=transcripts_grid_size,
     )
 
     written_files = dict(stage2_files)
