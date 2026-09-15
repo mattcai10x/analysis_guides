@@ -87,16 +87,27 @@
 #      (`TiffFile(...).series[...].levels[i].aszarr()`), one pyramid level at a
 #      time, so the full slide image is never materialized in memory. See
 #      `crop_morphology_image()`'s docstring for exactly what is shipped vs. ideal.
-#   e. binned_transcripts.zarr.zip and csc_cell_feature_matrix.zarr.zip are both
-#      viz-only/derived (not needed for *correctness*), but ARE included by
-#      default: the whole point of this script is a bundle that's actually
-#      visualizable in ziggy, not just structurally valid. csc_* was never
-#      skipped (see 2c above). binned_transcripts.zarr.zip is cropped via
-#      `crop_binned_transcripts_to_bbox`, which streams one gene at a time
-#      (see `atera_dataset_tools.crop`'s module docstring) rather than loading
-#      the whole ~5.3GB file at once -- pass `--skip-binned-transcripts` to
-#      omit it anyway (e.g. if ziggy's density view isn't needed for a given
-#      use case and you'd rather skip the extra I/O).
+#   e. csc_cell_feature_matrix.zarr.zip is viz-only/derived (not needed for
+#      *correctness*) but is included by default: the whole point of this
+#      script is a bundle that's actually visualizable in ziggy, not just
+#      structurally valid. It was never skipped (see 2c above).
+#
+#      binned_transcripts.zarr.zip is ALSO viz-only/derived, but is NOT
+#      produced in Stage 2 at all -- unlike every other file above, tile-
+#      cropping it in place (the original approach, `crop_binned_transcripts_
+#      to_bbox`) preserves the source file's ABSOLUTE, un-shifted tile
+#      coordinates (`origin`, `grid_keys`), which would leave it misaligned
+#      against everything else in the bundle once Stage 3b shifts transcripts
+#      to the crop-local origin (confirmed root cause of a real
+#      "transcripts only visible zoomed way out" bug report -- density data
+#      staying in absolute microns while the image/cells/transcripts move to
+#      local (0, 0)). So instead it is REGENERATED from scratch in Stage 3,
+#      directly from the already exact-polygon-filtered, already
+#      local-origin-shifted `filtered_transcripts` (see Stage 3b/3d below and
+#      `build_binned_transcripts_from_points`) -- this also means the one
+#      remaining full pass over the original ~5.3GB file is skipped entirely,
+#      not just kept cheap. Pass `--skip-binned-transcripts` to omit it anyway
+#      (e.g. if ziggy's density view isn't needed for a given use case).
 #
 # --------------------------------------------------------------------------------
 # COORDINATE ALIGNMENT: everything is relative to the cropped image's local origin
@@ -143,6 +154,8 @@
 #      intermediates (re-cropped, WITHOUT re-shifting, only if the sync step in
 #      3c dropped anything further, which should not normally happen since
 #      Stage 1 was already exact -- see the coordinate-alignment note below).
+#      binned_transcripts.zarr.zip is built here too, via
+#      `build_binned_transcripts_from_points` -- see the Stage 2e note above.
 #   e. Patch `experiment.spatial` with copied-forward manifest fields + recomputed
 #      `num_cells`/`transcripts_per_cell`/`num_transcripts`/`num_transcripts_high_quality`.
 #   f. Optional full zarr dump of the final small `SpatialData` object (`-z/--zarr_out`).
@@ -163,6 +176,7 @@ import xml.etree.ElementTree as ET
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import scipy.sparse
 import zarr
 
 warnings.filterwarnings("ignore")
@@ -174,6 +188,7 @@ if hasattr(zarr, "config"):
     zarr.config.set({"array.rectilinear_chunks": True})
 
 from atera_dataset_tools import crop as adt_crop  # noqa: E402
+from atera_dataset_tools.formats import binned_transcripts as adt_binned_transcripts  # noqa: E402
 from atera_dataset_tools.formats import cell_feature_matrix as adt_cfm  # noqa: E402
 from atera_dataset_tools.formats import cells as adt_cells  # noqa: E402
 from atera_dataset_tools.formats import transcripts as adt_transcripts  # noqa: E402
@@ -693,27 +708,6 @@ def crop_morphology_image(
     return crop_window_px
 
 
-def maybe_crop_binned_transcripts(src: str, dst: str, bbox, skip: bool) -> bool:
-    """Returns True if a binned_transcripts.zarr.zip was written to dst.
-
-    Included by default (see `skip`'s default in `main()`): binned_transcripts.zarr.zip
-    is viz-only/derived, but this script's whole point is a bundle that's actually
-    visualizable in ziggy, so it isn't optional in practice. Uses
-    `crop_binned_transcripts_to_bbox`, which streams one gene at a time (reads,
-    filters, and writes each gene's nested-zip archive independently) rather than
-    loading the whole file into memory -- see `atera_dataset_tools.crop`'s module
-    docstring. Possible future optimization, not yet implemented: regenerating the
-    density raster directly from the already-small cropped transcripts, rather
-    than touching the original file at all -- would save the one remaining full
-    pass over binned_transcripts.zarr.zip, but isn't needed for correctness or to
-    keep memory bounded (the streaming crop already does that).
-    """
-    if skip:
-        return False
-    adt_crop.crop_binned_transcripts_to_bbox(src, dst, bbox)
-    return True
-
-
 def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp_dir: str, args) -> dict:
     """Crop every large source file into `tmp_dir`, skipping files that already
     exist there unless `args.force_redo` is set. Returns a dict of the manifest
@@ -855,21 +849,12 @@ def stage2_crop(input_dir: str, manifest: dict, bbox, keep_rows: np.ndarray, tmp
         out[out_key + "_rel"] = rel
     log_checkpoint("Stage 2d: morphology image(s) windowed-cropped to local origin, pyramid preserved")
 
-    # -- binned_transcripts.zarr.zip: skipped by default --
-    if TRANSCRIPTS_VIZ_ZARR_KEY in explorer_files:
-        src = os.path.join(input_dir, explorer_files[TRANSCRIPTS_VIZ_ZARR_KEY])
-        dst = os.path.join(tmp_dir, "binned_transcripts.zarr.zip")
-        if not _skip_if_present(dst, args.force_redo):
-            wrote = maybe_crop_binned_transcripts(src, dst, bbox, args.skip_binned_transcripts)
-        else:
-            wrote = True
-            print(f"  [resume] {dst} already exists, skipping re-crop")
-        if wrote:
-            out["binned_transcripts"] = dst
-        log_checkpoint(
-            "Stage 2e: binned_transcripts.zarr.zip "
-            + ("skipped (--skip-binned-transcripts)" if not wrote else "cropped")
-        )
+    # binned_transcripts.zarr.zip is deliberately NOT touched here -- see the
+    # module-docstring note above (Stage 2e) and `build_binned_transcripts_
+    # from_points` (Stage 3d): tile-cropping it in place would preserve its
+    # absolute, un-shifted coordinates, misaligning it against everything
+    # else once transcripts are shifted to the local origin in Stage 3b. It's
+    # regenerated from scratch, later, from already-shifted data instead.
 
     return out
 
@@ -1028,6 +1013,99 @@ def build_points(filtered_transcripts, gene_names_per_row, pixel_size: float):
     )
 
 
+# Q20 is this format's own documented occupancy threshold -- see
+# `atera_dataset_tools/formats/binned_transcripts.py`'s module docstring:
+# "absent [gene] ones simply have no >=Q20 transcripts anywhere". Matches
+# what `patch_manifest`'s `num_transcripts_high_quality` already uses.
+_BINNED_TRANSCRIPTS_MIN_QUALITY = 20
+
+
+def build_binned_transcripts_from_points(
+    filtered_transcripts: "adt_transcripts.Transcripts",
+    gene_names_per_row: np.ndarray,
+    bin_size: float,
+) -> "adt_binned_transcripts.BinnedTranscripts":
+    """Regenerate `binned_transcripts.zarr.zip`'s density data directly from
+    Stage 3b's already exact-polygon-filtered, already local-origin-shifted
+    `filtered_transcripts`/`gene_names_per_row` -- instead of tile-cropping
+    the original binned_transcripts.zarr.zip, which preserves ABSOLUTE,
+    un-shifted `origin`/tile coordinates (see `atera_dataset_tools.crop`'s
+    `crop_binned_transcripts_to_tiles`/`_to_bbox` docstrings) and therefore
+    ends up offset from the image/cells/transcripts by exactly the crop's
+    local-origin shift -- the confirmed root cause of transcripts only being
+    visible when zoomed far out in ziggy.
+
+    Only `quality_score >= 20` transcripts are counted, matching this
+    format's own documented occupancy convention. Every surviving transcript
+    is binned into a SINGLE tile at local grid index (0, 0): the whole point
+    of a crop is that its extent is small, so there is no need to replicate
+    the source file's multi-tile absolute grid here -- one square tile sized
+    to just cover the filtered extent is enough, and keeps this function
+    simple. `bin_size` (microns per bin) is carried over from the SOURCE
+    file (via `adt_binned_transcripts.read_grid_shape`) purely so the
+    regenerated raster has the same visual resolution as the un-cropped
+    file; it is NOT re-derived from the crop's own size.
+
+    Returns a valid (possibly all-empty, if nothing survives the quality
+    filter) `BinnedTranscripts` -- `write()` handles a `genes={}` dict fine,
+    it just emits no `gene/` entries, matching the format's normal sparse-gene
+    semantics for a dataset with no occupied genes at all.
+    """
+    t = filtered_transcripts
+    keep = t.quality_score >= _BINNED_TRANSCRIPTS_MIN_QUALITY
+
+    if not np.any(keep):
+        return adt_binned_transcripts.BinnedTranscripts(
+            gene_names=list(t.gene_names), origin={"x": 0.0, "y": 0.0}, grid_size=bin_size, genes={},
+        )
+
+    # Local origin is already (0, 0) by construction (filtered_transcripts
+    # was already shifted in Stage 3b) -- clip any tiny negative
+    # floating-point noise at the edge rather than letting it produce a
+    # negative bin index below.
+    x = np.clip(t.x_position[keep].astype(np.float64), 0.0, None)
+    y = np.clip(t.y_position[keep].astype(np.float64), 0.0, None)
+    gene_names_kept = np.asarray(gene_names_per_row)[keep]
+
+    max_extent = float(max(x.max(initial=0.0), y.max(initial=0.0)))
+    # One square tile, sized (in whole bins) to cover every kept transcript --
+    # square because this format only stores a single `grid_size` (root attr)
+    # shared by both axes, so `bin_size = grid_size / rows` is only
+    # well-defined if rows == cols (see `read_grid_shape`'s docstring).
+    n_bins = max(1, int(np.ceil((max_extent + 1e-6) / bin_size)))
+    grid_size = n_bins * bin_size
+
+    gene_name_to_index = {name: i for i, name in enumerate(t.gene_names)}
+
+    genes: dict[int, "adt_binned_transcripts.GeneTiles"] = {}
+    for gene_name in np.unique(gene_names_kept):
+        # "Unassigned" (see `_resolve_gene_names`) is not a real gene index --
+        # transcripts.zarr.zip's own UNKNOWN_CODEWORD_INDEX convention excludes
+        # these from gene-level tables, and binned_transcripts.zarr.zip never
+        # had a container for them either.
+        if gene_name == "Unassigned":
+            continue
+        gene_index = gene_name_to_index.get(str(gene_name))
+        if gene_index is None:
+            continue
+        row_mask = gene_names_kept == gene_name
+        col_idx = np.clip(np.floor(x[row_mask] / bin_size).astype(np.int64), 0, n_bins - 1)
+        row_idx = np.clip(np.floor(y[row_mask] / bin_size).astype(np.int64), 0, n_bins - 1)
+        # (rows, cols) convention matches the rest of this toolchain's pixel
+        # rasters: rows=y, cols=x (see atera_dataset_tools.crop's mask-crop
+        # docstring). One transcript per row_mask entry -> value 1, summed at
+        # colliding (row, col) pairs by tocsr()'s duplicate-index handling.
+        counts = scipy.sparse.coo_matrix(
+            (np.ones(int(row_mask.sum()), dtype=np.uint16), (row_idx, col_idx)),
+            shape=(n_bins, n_bins),
+        ).tocsr()
+        genes[gene_index] = adt_binned_transcripts.GeneTiles(rows=n_bins, cols=n_bins, tiles={(0, 0): counts})
+
+    return adt_binned_transcripts.BinnedTranscripts(
+        gene_names=list(t.gene_names), origin={"x": 0.0, "y": 0.0}, grid_size=grid_size, genes=genes,
+    )
+
+
 def sync_table_and_boundaries(sdata) -> None:
     """Mirrors subset2zarr.py step 5: keep only cells present in both the table
     and the cell_boundaries GeoDataFrame. Expected to be a no-op here (Stage 1
@@ -1122,12 +1200,13 @@ def main() -> None:
                          help="Run Stage 0+1 only: report how many cells/tiles would be kept, then exit.")
     parser.add_argument("--skip-binned-transcripts", dest="skip_binned_transcripts", action="store_true",
                          default=False,
-                         help="Skip binned_transcripts.zarr.zip entirely (default: False -- it is cropped "
+                         help="Skip binned_transcripts.zarr.zip entirely (default: False -- it is regenerated "
                               "and included by default so the output bundle is visualizable in ziggy's "
-                              "density view; the crop streams one gene at a time, so this is cheap).")
+                              "density view; it's built from the already-small, already-shifted filtered "
+                              "transcripts, not read from the original file, so this is cheap).")
     parser.add_argument("--include-binned-transcripts", dest="skip_binned_transcripts", action="store_false",
-                         help="Crop binned_transcripts.zarr.zip from the original file (this is the default; "
-                              "this flag exists to override an earlier --skip-binned-transcripts).")
+                         help="Regenerate binned_transcripts.zarr.zip (this is the default; this flag exists "
+                              "to override an earlier --skip-binned-transcripts).")
     parser.add_argument("--keep-tmp", action="store_true",
                          help="Do not delete the Stage-2 intermediate directory afterward.")
     parser.add_argument("--tmp-dir", default=None,
@@ -1248,6 +1327,35 @@ def main() -> None:
         f"({filtered_transcripts.number_rnas} kept)"
     )
 
+    # -- binned_transcripts.zarr.zip: regenerated here (not in Stage 2 -- see
+    #    the module docstring's Stage 2e note) directly from the
+    #    already-filtered, already-shifted `filtered_transcripts` above, so it
+    #    lands at the same local origin as everything else instead of the
+    #    original file's absolute coordinates. `bin_size` is peeked cheaply
+    #    from the ORIGINAL source file (root attrs + one gene's grid attrs
+    #    only -- see `read_grid_shape`), not from the Stage-2 tmp dir, since
+    #    Stage 2 no longer produces a binned_transcripts intermediate at all.
+    binned_transcripts_written = False
+    if TRANSCRIPTS_VIZ_ZARR_KEY in manifest[EXPLORER_FILES_KEY] and not args.skip_binned_transcripts:
+        src_binned = os.path.join(args.input, manifest[EXPLORER_FILES_KEY][TRANSCRIPTS_VIZ_ZARR_KEY])
+        try:
+            grid_shape = adt_binned_transcripts.read_grid_shape(src_binned)
+        except ValueError:
+            print("  [binned_transcripts] source has no occupied genes at all; skipping")
+        else:
+            bin_size = grid_shape["grid_size"] / grid_shape["rows"]
+            binned_transcripts = build_binned_transcripts_from_points(
+                filtered_transcripts, gene_names_per_row, bin_size
+            )
+            binned_transcripts_out_path = os.path.join(args.output, "binned_transcripts.zarr.zip")
+            adt_binned_transcripts.write(binned_transcripts_out_path, binned_transcripts)
+            binned_transcripts_written = True
+    log_checkpoint(
+        "Stage 3b2: binned_transcripts.zarr.zip regenerated from shifted points"
+        if binned_transcripts_written else
+        "Stage 3b2: binned_transcripts.zarr.zip skipped"
+    )
+
     # -- Stage 3c: table + sync against boundaries --
     sdata.tables["table"] = build_table(stage2_files["cell_feature_matrix"], stage2_files["cells"])
     common_ids = sync_table_and_boundaries(sdata)
@@ -1311,6 +1419,8 @@ def main() -> None:
     )
 
     written_files = dict(stage2_files)
+    if binned_transcripts_written:
+        written_files["binned_transcripts"] = binned_transcripts_out_path
     for key in ("morphology_2d", "morphology_3d"):
         if key in stage2_files:
             # Copy every file `crop_morphology_image` wrote into this image's
@@ -1324,9 +1434,6 @@ def main() -> None:
             os.makedirs(dst_dir, exist_ok=True)
             for fname in os.listdir(src_dir):
                 shutil.copy2(os.path.join(src_dir, fname), os.path.join(dst_dir, fname))
-
-    if "binned_transcripts" in stage2_files:
-        shutil.copy2(stage2_files["binned_transcripts"], os.path.join(args.output, "binned_transcripts.zarr.zip"))
 
     log_checkpoint("Stage 3d: final bundle files written")
 
